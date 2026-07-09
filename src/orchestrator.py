@@ -85,7 +85,7 @@ async def prove_dag(
     blueprint: Blueprint,
     compiler: AbstractLeanCompiler | None,
     retrieval: MathlibRetrieval,
-    model: str = "labs-leanstral-1-5",
+    model: str = "gpt-4o",
     proved_cache: dict[str, str] | None = None,
     nodes_to_retry: set[str] | None = None,
     compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,

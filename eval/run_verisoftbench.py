@@ -582,7 +582,7 @@ def _run_phase_only(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Goedel-Architect on VeriSoftBench")
-    parser.add_argument("--model",    default="labs-leanstral-1-5")
+    parser.add_argument("--model",    default="accounts/fireworks/models/deepseek-v4-flash")
     parser.add_argument("--cascade-model", default=None,
                         help="If set, Phase 2 first attempts every node with this "
                              "(cheaper) model; --model is only used to escalate a "

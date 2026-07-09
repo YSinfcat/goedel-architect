@@ -87,7 +87,7 @@ def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_na
 def prove_theorem(
     theorem_stmt: str,
     nl_proof: str | None = None,
-    model: str = "labs-leanstral-1-5",
+    model: str = "gpt-5.5",
     compiler: AbstractLeanCompiler | None = None,
     compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
     retrieval: MathlibRetrieval | None = None,
@@ -342,7 +342,7 @@ def prove_theorem(
 def run_phase1(
     theorem_stmt: str,
     nl_proof: str | None = None,
-    model: str = "labs-leanstral-1-5",
+    model: str = "gpt-5.5",
     compiler: AbstractLeanCompiler | None = None,
     repo_context: str | None = None,
     checkpoint_path: Path | None = None,

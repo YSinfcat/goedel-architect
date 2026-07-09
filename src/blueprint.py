@@ -108,31 +108,6 @@ def _emit_usage(tracer, thm_name: str, phase: str, model: str, response) -> None
     ))
 
 
-def _append_assistant_turn(messages: list[dict], response) -> None:
-    """Append an assistant message from `response` to `messages`, preserving
-    tool_calls if present, followed by a synthetic tool reply for each one.
-
-    Some models (e.g. Leanstral) emit a tool_call even on turns where no
-    tools were declared in the request. Dropping the tool_calls here (keeping
-    only `.content`) leaves the replayed history inconsistent with any
-    tool-role messages a caller expects; the API then rejects the *next*
-    call either way - "Assistant message must have either content or
-    tool_calls" if dropped, or "tool call id X has no response" if kept
-    without a reply. A synthetic reply satisfies the latter.
-    """
-    msg = response.choices[0].message
-    assistant_msg: dict = {"role": "assistant", "content": msg.content}
-    if msg.tool_calls:
-        assistant_msg["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
-    messages.append(assistant_msg)
-    for tc in msg.tool_calls or []:
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tc.id,
-            "content": f"Tool unavailable: {tc.function.name}. No tools are available for this request.",
-        })
-
-
 def _call_with_repo_search(
     client: OpenAI,
     model: str,
@@ -285,7 +260,7 @@ class Blueprint:
 def generate_blueprint(
     theorem_stmt: str,
     nl_proof: str | None = None,
-    model: str = "labs-leanstral-1-5",
+    model: str = "gpt-5.5",
     compiler: AbstractLeanCompiler | None = None,
     repo_context: str | None = None,
     repo_retrieval=None,
@@ -336,7 +311,7 @@ def generate_blueprint(
                 # Downstream, an empty node set makes all_proved() vacuously
                 # true with no actual proof recorded, so this must be retried
                 # rather than accepted as a usable blueprint.
-                _append_assistant_turn(messages, response)
+                messages.append({"role": "assistant", "content": response.choices[0].message.content})
                 messages.append({
                     "role": "user",
                     "content": (
@@ -350,7 +325,7 @@ def generate_blueprint(
                 continue
             # Feed errors back to the model for the next attempt
             error_feedback = "\n".join(result.errors) or result.raw_output[-2000:]
-            _append_assistant_turn(messages, response)
+            messages.append({"role": "assistant", "content": response.choices[0].message.content})
             messages.append({
                 "role": "user",
                 "content": (
@@ -372,7 +347,7 @@ def generate_blueprint(
             # vacuously true downstream with no actual proof recorded, so
             # this must be retried the same way the compiler branch already
             # retries its own zero-node case above.
-            _append_assistant_turn(messages, response)
+            messages.append({"role": "assistant", "content": response.choices[0].message.content})
             messages.append({
                 "role": "user",
                 "content": (

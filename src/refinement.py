@@ -67,7 +67,7 @@ def refine_blueprint(
     blueprint: Blueprint,
     orch_result: OrchestratorResult,
     compiler: AbstractLeanCompiler,
-    model: str = "labs-leanstral-1-5",
+    model: str = "gpt-4o",
     repo_context: str | None = None,
     history: list[str] | None = None,
     iteration: int = 0,

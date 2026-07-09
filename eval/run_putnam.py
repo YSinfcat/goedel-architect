@@ -79,7 +79,7 @@ def load_putnam() -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate on PutnamBench")
-    parser.add_argument("--model", default="labs-leanstral-1-5")
+    parser.add_argument("--model", default="accounts/fireworks/models/deepseek-v4-flash")
     parser.add_argument("--limit", type=int, default=50, help="Problems to run (default 50 for quick eval)")
     parser.add_argument("--output", default="results/putnam_results.jsonl")
     parser.add_argument("--max-iterations", type=int, default=16,

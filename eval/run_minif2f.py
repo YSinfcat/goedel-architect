@@ -32,7 +32,7 @@ def load_minif2f(split: str = "test") -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate on MiniF2F-test")
-    parser.add_argument("--model", default="labs-leanstral-1-5", help="OpenAI, Fireworks, or Mistral model name")
+    parser.add_argument("--model", default="accounts/fireworks/models/deepseek-v4-flash", help="OpenAI or Fireworks model name")
     parser.add_argument("--split", default="test", choices=["test", "valid"])
     parser.add_argument("--limit", type=int, default=None, help="Max problems to run")
     parser.add_argument("--output", default="results/minif2f_results.jsonl")
