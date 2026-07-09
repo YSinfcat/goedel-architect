@@ -330,12 +330,19 @@ class GoedelProver:
         had_tool_calls = False
         last_compile_ok = False
         all_lean_errors: list[str] = []
+        last_errors: list[str] = []
 
         while tool_calls_used < self.max_tool_calls:
             had_tool_calls, text, proof, compile_ok, tools_called, compile_errors = self._process_response(
                 response, messages, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt
             )
             all_lean_errors.extend(compile_errors)
+            # Classification must react to the MOST RECENT compile attempt only:
+            # an early draft's "type mismatch" (later abandoned for a completely
+            # different approach) must not keep tainting the verdict just
+            # because all_lean_errors accumulates across the whole tool loop.
+            if compile_errors:
+                last_errors = compile_errors
             if text:
                 last_text = text
             if proof:
@@ -379,9 +386,11 @@ class GoedelProver:
             )
             self._emit_usage(node_name, response)
             _, drain_text, drain_proof, _, _, drain_errors = self._process_response(
-                response, messages, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt
+                response, messages, compiler, node_name, repo_retrieval, tool_calls_used
             )
             all_lean_errors.extend(drain_errors)
+            if drain_errors:
+                last_errors = drain_errors
             if drain_text:
                 last_text = drain_text
             if drain_proof:
@@ -401,9 +410,11 @@ class GoedelProver:
             )
             self._emit_usage(node_name, response)
             _, last_text, best_proof_body, _, _, final_errors = self._process_response(
-                response, messages, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt
+                response, messages, compiler, node_name, repo_retrieval, tool_calls_used
             )
             all_lean_errors.extend(final_errors)
+            if final_errors:
+                last_errors = final_errors
 
         # Probe negation if we couldn't prove it
         negation = self._probe_negation(compiler, node_name, messages, MAX_TOKENS)
@@ -411,10 +422,10 @@ class GoedelProver:
             return negation
 
         if best_proof_body:
-            signal = _classify_failure(last_text)
+            signal = _classify_failure(last_errors, last_text)
             return ProverResult(signal=signal, proof_body=best_proof_body,
                                 analysis=last_text[:500], lean_errors=all_lean_errors)
-        return ProverResult(signal=_classify_failure(last_text),
+        return ProverResult(signal=_classify_failure(last_errors, last_text),
                             analysis=last_text[:500], lean_errors=all_lean_errors)
 
     # ------------------------------------------------------------------
@@ -609,17 +620,18 @@ def _extract_proof_body(text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def _classify_failure(analysis: str) -> ProofSignal:
-    """`STATEMENT_WRONG` is reserved for cases with real evidence of falsity:
-    `_probe_negation` formally proving the negation (a separate signal,
-    FORMALLY_NEGATED) or the model's own analysis explicitly claiming
-    false/counterexample (word-boundary matched so identifiers like
-    `t_false`/`progress_false` don't false-positive on the bare substring
-    "false"). A compiler "type mismatch" is NOT such evidence - it's one of
-    the most generic Lean elaboration errors and fires for merely-wrong
-    tactics/lemma applications on true theorems just as often as on false
-    ones, so it must not be used to infer the goal itself is false."""
+def _classify_failure(errors: list[str], analysis: str) -> ProofSignal:
+    """Real compiler errors are checked first since they're authoritative; the
+    model's own commentary (`analysis`) is a weaker fallback signal and must
+    use word-boundary matching so identifiers like `t_false`/`progress_false`
+    don't false-positive on the bare substring "false"."""
+    errors_text = " ".join(errors).lower()
+    if "type mismatch" in errors_text:
+        return ProofSignal.STATEMENT_WRONG
+
     analysis_lower = analysis.lower()
+    if "type mismatch" in analysis_lower:
+        return ProofSignal.STATEMENT_WRONG
     if re.search(r"\b(false|counterexample)\b", analysis_lower):
         return ProofSignal.STATEMENT_WRONG
     return ProofSignal.PROOF_TOO_HARD

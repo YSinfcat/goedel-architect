@@ -402,7 +402,6 @@ def evaluate_theorem_phase(
             orch_result = run_phase2(
                 checkpoint_path=checkpoint_path, compiler_factory=make_compiler,
                 retrieval=retrieval, repo_retrieval=repo_retrieval, tracer=tracer,
-                model=model,
                 cascade_model=cascade_model, cascade_timeout_s=cascade_timeout_s,
                 escalation_max_tool_calls=escalation_max_tool_calls,
             )
