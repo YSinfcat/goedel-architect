@@ -36,6 +36,42 @@ def _own_declaration_uses_sorry(combined_output: str, target_line: int) -> bool:
     )
 
 
+# A Lean diagnostic header: `<file>:<line>:<col>: <severity>[:( ] ...`. The
+# `[\(:]` tolerates both `error:` and the rarer `error(` code form.
+_DIAG_HEADER_RE = re.compile(r"^.*?:\d+:\d+:\s*(error|warning|info)[\(:]")
+
+
+def _extract_errors(combined_output: str) -> list[str]:
+    """Return full, multi-line error diagnostics from raw Lean output.
+
+    A Lean error is a *block*: a `... : error: <header>` line followed by
+    indented/unindented continuation lines carrying the actual diagnostic
+    (`has type X but is expected to have type Y`, the offending term, the
+    unsolved goal, etc.) up to the next diagnostic header. The old code kept
+    only the header line and discarded every continuation, so a proof that
+    failed with `type mismatch` reached the model as the bare string
+    "type mismatch" with no expected/actual types - blinding it and causing
+    it to thrash for its whole tool budget on otherwise one-line goals
+    (observed on TM.progress's trivially-true base cases). Each returned
+    element is one error's complete block, warnings/info excluded.
+    """
+    blocks: list[str] = []
+    current: list[str] | None = None
+    current_is_error = False
+    for line in combined_output.splitlines():
+        m = _DIAG_HEADER_RE.match(line)
+        if m:
+            if current is not None and current_is_error:
+                blocks.append("\n".join(current).rstrip())
+            current = [line]
+            current_is_error = m.group(1) == "error"
+        elif current is not None:
+            current.append(line)
+    if current is not None and current_is_error:
+        blocks.append("\n".join(current).rstrip())
+    return blocks
+
+
 def _node_signature(node_decl: str) -> str:
     """Bare theorem/lemma signature (no body) for a blueprint node's own
     declaration - shares BlueprintNode.signature()'s exact helpers
@@ -120,7 +156,7 @@ class VSBLeanCompiler(AbstractLeanCompiler):
                 timeout=BLUEPRINT_COMPILE_TIMEOUT,
             )
             combined = result.stdout + result.stderr
-            errors = [l for l in combined.splitlines() if re.search(r": error[\(:]", l)]
+            errors = _extract_errors(combined)
             # sorry warnings are expected in blueprints — ignore them
             if errors:
                 return CompilerResult(success=False, errors=errors)
@@ -212,7 +248,7 @@ class VSBLeanCompiler(AbstractLeanCompiler):
             target_line = content[:target_pos].count("\n") + 1 if target_pos != -1 else 0
             if _own_declaration_uses_sorry(combined, target_line):
                 return CompilerResult(success=False, errors=["declaration uses 'sorry' — proof incomplete"])
-            errors = [l for l in combined.splitlines() if re.search(r": error[\(:]", l)]
+            errors = _extract_errors(combined)
             if errors:
                 return CompilerResult(success=False, errors=errors)
             return CompilerResult(success=True)

@@ -40,7 +40,7 @@ import utils.utils as utils
 from checkpoint import CheckpointState, path_for_theorem
 from lean_compiler import AbstractLeanCompiler
 from mathlib_retrieval import MathlibRetrieval
-from pipeline import prove_theorem, ProofResult, run_phase1, run_phase2, run_phase3
+from pipeline import prove_theorem, ProofResult, run_phase1, run_phase2, run_phase3, MAX_REFINEMENT_ITERATIONS
 from prover import GoedelProver
 from repo_retrieval import RepoRetrieval
 from tracer import JsonlTracer, NullTracer, TraceEvent
@@ -119,6 +119,8 @@ def evaluate_theorem(
     verbose: bool,
     checkpoint_dir: Path | None = None,
     aristotle_mode: bool = False,
+    phase1_model: str | None = None,
+    phase3_model: str | None = None,
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
@@ -170,6 +172,8 @@ def evaluate_theorem(
             proof_result: ProofResult = prove_theorem(
                 theorem_stmt=thm_stmt,
                 model=model,
+                phase1_model=phase1_model,
+                phase3_model=phase3_model,
                 compiler_factory=make_compiler,
                 retrieval=retrieval,
                 repo_retrieval=repo_retrieval,
@@ -350,6 +354,7 @@ def evaluate_theorem_phase(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
+    max_iterations: int = MAX_REFINEMENT_ITERATIONS,
 ) -> dict:
     """Run exactly one of Phase 1/2/3 against this theorem's checkpoint file.
 
@@ -381,6 +386,7 @@ def evaluate_theorem_phase(
         return VSBLeanCompiler(lean_repl, theorem_entry, call_prefix="ga")
 
     t0 = time.monotonic()
+    usage_names = {thm_name}
     try:
         verif_ctx = _build_verif_context(lean_repl, theorem_entry, lean_root,
                                           rel_path, imports, local_ctx, thm_stmt, thm_name,
@@ -401,7 +407,7 @@ def evaluate_theorem_phase(
         elif phase == 2:
             orch_result = run_phase2(
                 checkpoint_path=checkpoint_path, compiler_factory=make_compiler,
-                retrieval=retrieval, repo_retrieval=repo_retrieval, tracer=tracer,
+                retrieval=retrieval, repo_retrieval=repo_retrieval, model=model, tracer=tracer,
                 cascade_model=cascade_model, cascade_timeout_s=cascade_timeout_s,
                 escalation_max_tool_calls=escalation_max_tool_calls,
             )
@@ -423,6 +429,7 @@ def evaluate_theorem_phase(
                 checkpoint_path=checkpoint_path, compiler=make_compiler(),
                 model=model, repo_context=verif_ctx,
                 repo_retrieval=repo_retrieval, tracer=tracer, thm_name=thm_name,
+                max_iterations=max_iterations,
             )
             result.update(
                 ok=True, validated=blueprint.fully_validated,
@@ -520,6 +527,11 @@ def _run_phase_only(
     lake-safety constraint as the full pipeline — see run_repo_queue)."""
     phase_results_file = output_dir / f"phase{args.phase}_results.jsonl"
 
+    # --model is Phase 2's model; --phase1-model/--phase3-model override it
+    # for Phases 1/3 (see prove_theorem's docstring in pipeline.py for the
+    # same convention in the full --blueprint pipeline).
+    phase_model = {1: args.phase1_model, 2: args.model, 3: args.phase3_model}[args.phase]
+
     by_repo: dict[str, list[dict]] = defaultdict(list)
     for entry in problems:
         by_repo[entry.get("lean_root", "")].append(entry)
@@ -541,12 +553,13 @@ def _run_phase_only(
                 repo_retrieval=repo_retrievals.get(entry.get("lean_root", "")),
                 phase=args.phase,
                 checkpoint_dir=checkpoint_dir,
-                model=args.model,
+                model=phase_model,
                 tracer=tracer,
                 aristotle_mode=args.aristotle_subset,
                 cascade_model=args.cascade_model,
                 cascade_timeout_s=args.cascade_timeout,
                 escalation_max_tool_calls=args.escalation_max_tool_calls,
+                max_iterations=args.max_iterations,
             )
             with results_lock:
                 all_results.append(res)
@@ -582,7 +595,16 @@ def _run_phase_only(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Goedel-Architect on VeriSoftBench")
-    parser.add_argument("--model",    default="accounts/fireworks/models/deepseek-v4-flash")
+    parser.add_argument("--model",    default="accounts/fireworks/models/deepseek-v4-flash",
+                        help="Phase 2 (per-node proving) model; also Phase 1/3's "
+                             "model unless --phase1-model/--phase3-model override it. "
+                             "Only used by --blueprint's full 3-phase pipeline.")
+    parser.add_argument("--phase1-model", default="gpt-5.5",
+                        help="Overrides --model for Phase 1 (blueprint generation) "
+                             "only. Only used by --blueprint's full 3-phase pipeline.")
+    parser.add_argument("--phase3-model", default="gpt-5.5",
+                        help="Overrides --model for Phase 3 (refinement) only. "
+                             "Only used by --blueprint's full 3-phase pipeline.")
     parser.add_argument("--cascade-model", default=None,
                         help="If set, Phase 2 first attempts every node with this "
                              "(cheaper) model; --model is only used to escalate a "
@@ -617,8 +639,8 @@ def main() -> None:
                              "(same-file preceding proofs elided, plus "
                              "ground-truth-used lemma statements guaranteed "
                              "visible) — for comparing against Table 3's "
-                             "VeriSoftBench-Aristotle row (Aristotle 69%, "
-                             "Gemini-3-Pro 65%)")
+                             "VeriSoftBench-Aristotle row (Aristotle 69%%, "
+                             "Gemini-3-Pro 65%%)")
     parser.add_argument("--repo",    default=None)
     parser.add_argument("--exclude-repo", default=None,
                         help="Comma-separated repo names to skip (e.g. known-broken builds)")
@@ -650,6 +672,12 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", default=None,
                         help="Directory for per-theorem checkpoint files used "
                              "by --phase (default: <output>/checkpoints/)")
+    parser.add_argument("--max-iterations", type=int, default=MAX_REFINEMENT_ITERATIONS,
+                        help=f"Cap on Phase 3 refinement rounds (paper default: "
+                             f"{MAX_REFINEMENT_ITERATIONS}, per Appendix A). Raise "
+                             f"this to keep refining past the paper's own budget "
+                             f"for exploratory testing; lower it not recommended "
+                             f"for anything meant to compare against reported numbers.")
     parser.add_argument("--trace", metavar="PATH", nargs="?", const="",
                         help="Write JSONL trace (default: results/verisoftbench/trace.jsonl)")
     args = parser.parse_args()
@@ -709,7 +737,8 @@ def main() -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     if args.phase is not None:
-        print(f"  Phase-only mode: Phase {args.phase}, checkpoints in {checkpoint_dir}")
+        phase_model = {1: args.phase1_model, 2: args.model, 3: args.phase3_model}[args.phase]
+        print(f"  Phase-only mode: Phase {args.phase} (model={phase_model}), checkpoints in {checkpoint_dir}")
         _run_phase_only(problems, lean_repl, retrieval, repo_retrievals, args, output_dir, checkpoint_dir, tracer)
         return
 
@@ -764,6 +793,8 @@ def main() -> None:
             verbose=args.verbose,
             checkpoint_dir=checkpoint_dir if args.blueprint else None,
             aristotle_mode=args.aristotle_subset,
+            phase1_model=args.phase1_model,
+            phase3_model=args.phase3_model,
             cascade_model=args.cascade_model,
             cascade_timeout_s=args.cascade_timeout,
             escalation_max_tool_calls=args.escalation_max_tool_calls,

@@ -16,6 +16,7 @@ from blueprint import (
     _extract_lean_code,
     _parse_blueprint,
     _reasoning_kwargs,
+    find_blueprint_cycle,
 )
 from lean_compiler import AbstractLeanCompiler
 from orchestrator import OrchestratorResult
@@ -141,6 +142,22 @@ def refine_blueprint(
         if result.success:
             parsed = _parse_blueprint(lean_code, blueprint.target_theorem)
             if parsed.nodes:
+                cycle = find_blueprint_cycle(parsed)
+                if cycle:
+                    print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: "
+                          f"check_blueprint OK but invalid dependency structure - {cycle!r}", flush=True)
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"The blueprint has an invalid dependency structure "
+                            f"(attempt {attempt + 1}/{MAX_RETRIES}): {cycle}\n\n"
+                            "Re-emit the blueprint with an acyclic dependency structure "
+                            "where every node's sorry_using [...] list only cites "
+                            "already-established facts, never the target theorem itself."
+                        ),
+                    })
+                    continue
                 parsed.fully_validated = result.validated
                 print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint OK", flush=True)
                 return parsed

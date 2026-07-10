@@ -303,6 +303,20 @@ def generate_blueprint(
             if result.success:
                 parsed = _parse_blueprint(lean_code, target)
                 if parsed.nodes:
+                    cycle = find_blueprint_cycle(parsed)
+                    if cycle:
+                        messages.append({"role": "assistant", "content": response.choices[0].message.content})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"The blueprint has an invalid dependency structure "
+                                f"(attempt {attempt + 1}/{MAX_RETRIES}): {cycle}\n\n"
+                                "Re-emit the blueprint with an acyclic dependency structure "
+                                "where every node's sorry_using [...] list only cites "
+                                "already-established facts, never the target theorem itself."
+                            ),
+                        })
+                        continue
                     parsed.fully_validated = result.validated
                     return parsed
                 # Compiles, but has zero @[blueprint]-annotated declarations —
@@ -443,6 +457,57 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
         ))
 
     return Blueprint(nodes=nodes, lean_file=lean_code, target_theorem=target_theorem)
+
+
+def find_blueprint_cycle(blueprint: Blueprint) -> str | None:
+    """Return a description of a dependency-cycle defect, or None if clean.
+
+    Caught concretely on TM.progress: a refinement round had gpt-5.5 add a
+    helper node whose `sorry_using [progress]` cited the target theorem
+    itself as an "already available" fact (rationalized as reusing the
+    ground-truth repo's own real proof of `progress` via its import), while
+    `progress` in turn depended on that helper - a 2-cycle that crashed
+    orchestrator.py's `nx.topological_generations` with an unhandled
+    NetworkXUnfeasible. A node citing the target before it's proved is
+    circular reasoning regardless of whether it closes a graph cycle through
+    other nodes, so that's checked directly and not just via cycle-search.
+    """
+    names = {n.name for n in blueprint.nodes}
+    graph = {n.name: [d for d in n.dependencies if d in names] for n in blueprint.nodes}
+
+    for name, deps in graph.items():
+        if name != blueprint.target_theorem and blueprint.target_theorem in deps:
+            return (
+                f"'{name}' lists the target theorem '{blueprint.target_theorem}' "
+                "itself in sorry_using [...] - the target isn't proved yet, so no "
+                "other node may cite it as an already-available fact (this includes "
+                "citing an existing proof of it from an imported file)."
+            )
+
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {name: WHITE for name in graph}
+    path: list[str] = []
+
+    def visit(name: str) -> str | None:
+        color[name] = GRAY
+        path.append(name)
+        for dep in graph.get(name, []):
+            if color.get(dep) == GRAY:
+                return " -> ".join(path[path.index(dep):] + [dep])
+            if color.get(dep) == WHITE:
+                found = visit(dep)
+                if found:
+                    return found
+        path.pop()
+        color[name] = BLACK
+        return None
+
+    for name in graph:
+        if color[name] == WHITE:
+            found = visit(name)
+            if found:
+                return f"dependency cycle: {found}"
+    return None
 
 
 def _extract_attr(attrs: str, key: str) -> str:

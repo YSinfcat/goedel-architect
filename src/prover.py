@@ -31,6 +31,23 @@ def _responses_reasoning_kwargs(model: str) -> dict:
         return {"reasoning": {"effort": "low"}}
     return {}
 
+
+def _force_lean_compile_kwargs() -> dict:
+    """`tools`/`tool_choice` kwargs that force the next call to be lean_compile.
+
+    Not OpenAI's named-function tool_choice shape ({"type": "function", "name":
+    ...}) - Fireworks' Responses API rejects that with a 400 (verified against
+    the live endpoint), accepting only the bare "required"/"auto"/"none"/"any"
+    literals, which force *some* tool call but can't pin down which one; a
+    Fireworks-hosted model kept picking repo_search again instead of ever
+    reaching lean_compile. Restricting the visible `tools` list to just
+    lean_compile makes "required" unambiguous on every provider, and as a
+    side effect also stops a model from hallucinating a nonexistent tool
+    (observed: a Fireworks-hosted model repeatedly invented an "open_file"
+    tool that was never declared).
+    """
+    return {"tools": [TOOLS[0]], "tool_choice": "required"}
+
 try:
     from repo_retrieval import RepoRetrieval
     _HAS_REPO_RETRIEVAL = True
@@ -59,15 +76,23 @@ SYSTEM_SUFFIX = """
 
 You have three tools: lean_compile, repo_search, mathlib_search.
 
-**Key insight**: the prompt already contains repo context in <used_repo_defs>,
-<repo_lemmas>, and <local_ctx>. Read these first — the lemmas you need are
-likely already visible.
+**Key insight**: the prompt already contains this file's own preceding
+declarations in <local_ctx> (definitions in full, lemma/theorem PROOFS
+elided). Read it first — some of what you need is likely already visible
+there. Anything from *outside* this file (other modules, or same-file
+lemma statements local_ctx happened to omit) is NOT pre-loaded — you must
+fetch it yourself via repo_search (project-specific) or mathlib_search
+(Mathlib).
 
 Workflow:
 1. Draft a proof using the visible repo definitions.
 2. Call lean_compile with your proof_body (starting with `:= by` — the harness
    appends proof_body directly after the bare theorem signature, so the leading
-   `:=` is required or the submission fails to parse).
+   `:=` is required or the submission fails to parse). proof_body is TACTIC
+   MODE ONLY: `#check`/`#eval`/`#print` and other `#`-commands are top-level
+   commands, not tactics, and will hard-fail with "unexpected token" if placed
+   there — do not use them to inspect a type mid-proof; instead reason from
+   what's already visible in <local_ctx>, or call repo_search/mathlib_search.
 3. Read errors, adjust, call lean_compile again.
 4. When you need a lemma whose name you do NOT already know:
    - call repo_search for project-specific lemmas
@@ -300,9 +325,8 @@ class GoedelProver:
             model=self.model_id,
             instructions=augmented_sys,
             input=user_prompt,
-            tools=TOOLS,
-            tool_choice={"type": "function", "name": "lean_compile"},
             max_output_tokens=MAX_TOKENS,
+            **_force_lean_compile_kwargs(),
             **_responses_reasoning_kwargs(self.model_id),
         )
         self._emit_usage(node_name, response)
@@ -314,10 +338,18 @@ class GoedelProver:
         last_compile_ok = False
         all_lean_errors: list[str] = []
         last_errors: list[str] = []
+        # Signatures of repo_search hits this node has seen so far, auto-spliced
+        # into every lean_compile call's aux_lemmas (see _process_response) -
+        # repo_search finding a real repo lemma doesn't put it in scope for the
+        # compiler on its own (that only reflects what's textually in the
+        # compiled unit), and a model citing it by name otherwise just gets
+        # "unknown identifier" regardless of how correct its proof is.
+        discovered_decls: dict[str, str] = {}
 
         while tool_calls_used < self.max_tool_calls:
             tool_results, text, proof, compile_ok, tools_called, compile_errors = self._process_response(
-                response, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt
+                response, compiler, node_name, repo_retrieval, tool_calls_used, node_decl=node_stmt,
+                discovered_decls=discovered_decls,
             )
             all_lean_errors.extend(compile_errors)
             # Classification must react to the MOST RECENT compile attempt only:
@@ -343,15 +375,17 @@ class GoedelProver:
             if tool_calls_used >= self.max_tool_calls:
                 break
 
-            next_choice = {"type": "function", "name": "lean_compile"} if (had_search and not had_compile) else "required"
+            next_tool_kwargs = (
+                _force_lean_compile_kwargs() if (had_search and not had_compile)
+                else {"tools": TOOLS, "tool_choice": "required"}
+            )
 
             response = self.client.responses.create(
                 model=self.model_id,
                 previous_response_id=response.id,
                 input=tool_results,
-                tools=TOOLS,
-                tool_choice=next_choice,
                 max_output_tokens=MAX_TOKENS,
+                **next_tool_kwargs,
                 **_responses_reasoning_kwargs(self.model_id),
             )
             self._emit_usage(node_name, response)
@@ -369,7 +403,8 @@ class GoedelProver:
             )
             self._emit_usage(node_name, response)
             _, drain_text, drain_proof, _, _, drain_errors = self._process_response(
-                response, compiler, node_name, repo_retrieval, tool_calls_used
+                response, compiler, node_name, repo_retrieval, tool_calls_used,
+                discovered_decls=discovered_decls,
             )
             all_lean_errors.extend(drain_errors)
             if drain_errors:
@@ -390,14 +425,15 @@ class GoedelProver:
             )
             self._emit_usage(node_name, response)
             _, last_text, best_proof_body, _, _, final_errors = self._process_response(
-                response, compiler, node_name, repo_retrieval, tool_calls_used
+                response, compiler, node_name, repo_retrieval, tool_calls_used,
+                discovered_decls=discovered_decls,
             )
             all_lean_errors.extend(final_errors)
             if final_errors:
                 last_errors = final_errors
 
         # Probe negation if we couldn't prove it
-        negation = self._probe_negation(compiler, node_name, response.id, MAX_TOKENS)
+        negation = self._probe_negation(compiler, node_name, response.id, MAX_TOKENS, discovered_decls)
         if negation:
             return negation
 
@@ -420,6 +456,7 @@ class GoedelProver:
         repo_retrieval,
         tool_calls_so_far: int,
         node_decl: str = "",
+        discovered_decls: dict[str, str] | None = None,
     ) -> tuple[list[dict], str, str, bool, list[str], list[str]]:
         tool_results: list[dict] = []
         last_text = ""
@@ -448,8 +485,30 @@ class GoedelProver:
                     # (see BlueprintNode.signature) so the model can reference them
                     # by name instead of hitting "unknown identifier".
                     parent_decls = getattr(self, "_parent_lemma_decls", "")
-                    full_aux = f"{parent_decls}\n\n{aux}".strip() if parent_decls else aux
+                    full_aux = "\n\n".join(p for p in (parent_decls, aux) if p.strip())
                     cr = compiler.check(proof_body, aux_lemmas=full_aux, node_decl=node_decl)
+                    if not cr.success and discovered_decls:
+                        # Self-heal a missing-context gap: a repo_search hit found
+                        # a real repo lemma's signature, but that alone doesn't
+                        # put it in scope for the compiler (only the compiled
+                        # unit's own text does) - only inject a signature-only
+                        # stub (`:= sorry`, never the real proof - that would
+                        # reintroduce the exact advantage the raw-file-read leak
+                        # fix removed) for a name the compiler *just this attempt*
+                        # proved missing, so a name that's already legitimately in
+                        # scope is never redeclared (that caused a real
+                        # 'X has already been declared' regression when this was
+                        # tried proactively for every search hit up front).
+                        missing = set(re.findall(r"unknown identifier '([^']+)'", "\n".join(cr.errors)))
+                        healable = {
+                            stub for name, stub in discovered_decls.items()
+                            if name in missing or any(m.rsplit(".", 1)[-1] == name for m in missing)
+                        }
+                        if healable:
+                            healed_aux = "\n\n".join(p for p in (full_aux, *healable) if p.strip())
+                            retry = compiler.check(proof_body, aux_lemmas=healed_aux, node_decl=node_decl)
+                            if retry.success:
+                                cr = retry
                     if cr.success:
                         result = "Compilation SUCCESSFUL. Proof is correct."
                         any_compile_ok = True
@@ -461,15 +520,18 @@ class GoedelProver:
                         compile_errors.extend(cr.errors)
 
                 elif fn == "repo_search" and repo_retrieval is not None:
-                    hits = repo_retrieval.search(args["query"], args.get("k", 10))
+                    hits = repo_retrieval.search(args["query"], int(args.get("k", 10)))
                     result = "\n\n".join(h.format() for h in hits) or "No results in repo."
+                    if discovered_decls is not None:
+                        for h in hits:
+                            discovered_decls.setdefault(h.name, f"{h.kind} {h.name} {h.signature} := sorry")
 
                 elif fn == "mathlib_search":
-                    hits = self.retrieval.search(args["query"], args.get("k", 10))
+                    hits = self.retrieval.search(args["query"], int(args.get("k", 10)))
                     result = "\n\n".join(h.format() for h in hits) or "No results found."
 
                 else:
-                    result = f"Tool unavailable: {fn}"
+                    result = f"Tool unavailable: {fn}. Valid tools: lean_compile, repo_search, mathlib_search."
 
                 self.tracer.emit(TraceEvent(
                     kind="tool_result", thm_name=node_name, turn=turn,
@@ -511,6 +573,7 @@ class GoedelProver:
         node_name: str,
         previous_response_id: str,
         max_tokens: int,
+        discovered_decls: dict[str, str] | None = None,
     ) -> ProverResult | None:
         prompt = (
             f"You could not prove the statement. Try to show it is FALSE.\n"
@@ -522,9 +585,8 @@ class GoedelProver:
             model=self.model_id,
             previous_response_id=previous_response_id,
             input=prompt,
-            tools=TOOLS,
-            tool_choice={"type": "function", "name": "lean_compile"},
             max_output_tokens=max_tokens,
+            **_force_lean_compile_kwargs(),
             **_responses_reasoning_kwargs(self.model_id),
         )
         self._emit_usage(node_name, response)
@@ -537,7 +599,19 @@ class GoedelProver:
                 args = json.loads(item.arguments)
                 if item.name == "lean_compile":
                     parent_decls = getattr(self, "_parent_lemma_decls", "")
-                    cr = compiler.check(args.get("proof_body", ""), aux_lemmas=parent_decls)
+                    proof_body = args.get("proof_body", "")
+                    cr = compiler.check(proof_body, aux_lemmas=parent_decls)
+                    if not cr.success and discovered_decls:
+                        missing = set(re.findall(r"unknown identifier '([^']+)'", "\n".join(cr.errors)))
+                        healable = {
+                            stub for name, stub in discovered_decls.items()
+                            if name in missing or any(m.rsplit(".", 1)[-1] == name for m in missing)
+                        }
+                        if healable:
+                            healed_aux = "\n\n".join(p for p in (parent_decls, *healable) if p.strip())
+                            retry = compiler.check(proof_body, aux_lemmas=healed_aux)
+                            if retry.success:
+                                cr = retry
                     if cr.success:
                         return ProverResult(
                             signal=ProofSignal.FORMALLY_NEGATED,
@@ -577,18 +651,37 @@ def _extract_proof_body(text: str) -> str:
 
 
 def _classify_failure(errors: list[str], analysis: str) -> ProofSignal:
-    """Real compiler errors are checked first since they're authoritative; the
-    model's own commentary (`analysis`) is a weaker fallback signal and must
-    use word-boundary matching so identifiers like `t_false`/`progress_false`
-    don't false-positive on the bare substring "false"."""
-    errors_text = " ".join(errors).lower()
-    if "type mismatch" in errors_text:
-        return ProofSignal.STATEMENT_WRONG
+    """A failed proof attempt is PROOF_TOO_HARD by default.
 
-    analysis_lower = analysis.lower()
-    if "type mismatch" in analysis_lower:
-        return ProofSignal.STATEMENT_WRONG
-    if re.search(r"\b(false|counterexample)\b", analysis_lower):
+    STATEMENT_WRONG is expensive to be wrong about: refinement's prompt
+    reacts to it by rewriting or dropping the lemma's statement (see
+    prompts/refinement_system.md), so a false STATEMENT_WRONG destroys a
+    perfectly good sub-goal and churns the whole refinement loop. It
+    therefore requires actual evidence the *statement* is false - not merely
+    that some proof term failed to typecheck.
+
+    A Lean "type mismatch" is NOT such evidence. It's the compiler's generic
+    complaint that a supplied term had the wrong shape, and it fires
+    constantly on ordinary wrong-tactic attempts against perfectly true
+    goals. Observed concretely on TM.progress: `progress_tru`, `progress_zro`,
+    `succ_value_of_nvalue`, and `iszero_step_of_nvalue` are all trivially true,
+    yet every attempt tripped "type mismatch" (because `value` is a nested
+    `Or` needing a double `Or.inl`, and the model kept trying a single
+    injection) and all four were wrongly marked statement_wrong, sending
+    refinement off to "fix" statements that were already correct. So a bare
+    "type mismatch" - in the compiler errors OR echoed in the model's own
+    commentary - is deliberately NOT treated as a statement-falsity signal.
+
+    Machine-checked statement-falsity is the negation probe's job
+    (FORMALLY_NEGATED), handled before this function is ever reached. Here we
+    only escalate to STATEMENT_WRONG when the model itself explicitly concludes
+    the statement is false / exhibits a counterexample in its own reasoning.
+    """
+    # (?<!\.) excludes dotted-qualified identifiers like `Tm.false`/`Bool.false`
+    # (a real AST constructor, not a claim the theorem is false) - \b alone
+    # only guards underscore-joined identifiers (`t_false`) since `.` is a
+    # non-word char and still satisfies \b on its own.
+    if re.search(r"(?<!\.)\b(false|counterexample)\b", analysis.lower()):
         return ProofSignal.STATEMENT_WRONG
     return ProofSignal.PROOF_TOO_HARD
 

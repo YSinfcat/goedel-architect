@@ -123,6 +123,13 @@ async def prove_dag(
         if not given.
     """
     dag = _build_dag(blueprint)
+    if not nx.is_directed_acyclic_graph(dag):
+        # A stale checkpoint could still hold a blueprint saved before
+        # find_blueprint_cycle existed (blueprint.py) - fail with a clear,
+        # catchable error here instead of letting a bare NetworkXUnfeasible
+        # surface deep inside the topological_generations loop below.
+        cycle = nx.find_cycle(dag)
+        raise ValueError(f"Blueprint dependency graph has a cycle: {cycle}")
     dag_node_names = set(dag.nodes)
     orch_result = OrchestratorResult()
     proof_bodies: dict[str, str] = dict(proved_cache or {})

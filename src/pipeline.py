@@ -88,6 +88,8 @@ def prove_theorem(
     theorem_stmt: str,
     nl_proof: str | None = None,
     model: str = "gpt-5.5",
+    phase1_model: str | None = None,
+    phase3_model: str | None = None,
     compiler: AbstractLeanCompiler | None = None,
     compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
     retrieval: MathlibRetrieval | None = None,
@@ -112,6 +114,10 @@ def prove_theorem(
     Up to `max_iterations` refinement loops (default 8, per Appendix A).
 
     Args:
+        model: Phase 2 (per-node proving) model. Also the Phase 1/3 model
+            whenever phase1_model/phase3_model are left unset.
+        phase1_model: Overrides `model` for Phase 1 (blueprint generation) only.
+        phase3_model: Overrides `model` for Phase 3 (refinement) only.
         compiler: Shared compiler instance (used for all nodes).
         compiler_factory: Called once per node to get a fresh compiler.
             Use this for VSBLeanCompiler which tracks call state per-theorem.
@@ -179,7 +185,7 @@ def prove_theorem(
         blueprint = generate_blueprint(
             theorem_stmt=theorem_stmt,
             nl_proof=nl_proof,
-            model=model,
+            model=phase1_model or model,
             compiler=blueprint_compiler,
             repo_context=repo_context,
             repo_retrieval=repo_retrieval,
@@ -274,7 +280,7 @@ def prove_theorem(
                 blueprint=blueprint,
                 orch_result=orch_result,
                 compiler=refinement_compiler,
-                model=model,
+                model=phase3_model or model,
                 repo_context=repo_context,
                 history=refinement_history,
                 iteration=iteration,
@@ -374,6 +380,7 @@ def run_phase2(
     compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
     retrieval: MathlibRetrieval | None = None,
     repo_retrieval=None,
+    model: str | None = None,
     tracer=None,
     node_timeout_s: float | None = 300.0,
     cascade_model: str | None = None,
@@ -386,6 +393,12 @@ def run_phase2(
     (raises if it's missing or has no blueprint). Only nodes not already in
     `proved_cache` are attempted; the checkpoint is updated with the new
     `proved_cache` and `node_results` (the latter needed by Phase 3).
+
+    model: Overrides whatever model Phase 1 checkpointed (state.model) for
+        this Phase 2 pass only - lets a caller run Phase 1 with one model
+        (e.g. a strong blueprint-generation model) and Phase 2 with another
+        (e.g. a cheaper per-node proving model) against the same checkpoint.
+        Defaults to state.model when not given.
     """
     state = CheckpointState.load(checkpoint_path)
     blueprint = state.get_blueprint()
@@ -404,7 +417,7 @@ def run_phase2(
             compiler_factory=compiler_factory,
             retrieval=retrieval,
             repo_retrieval=repo_retrieval,
-            model=state.model,
+            model=model or state.model,
             proved_cache=proved_cache,
             nodes_to_retry=nodes_to_try,
             tracer=tracer,
