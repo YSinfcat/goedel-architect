@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 VSB_ROOT = Path(__file__).parent.parent.parent / "VeriSoftBench"
@@ -22,6 +23,21 @@ from lean_compiler import AbstractLeanCompiler, CompilerResult
 from blueprint import strip_blueprint_attr, lemma_to_theorem
 
 BLUEPRINT_COMPILE_TIMEOUT = 120  # seconds
+
+# `lake env lean` is not safe concurrently against the same project directory:
+# parallel Phase-2 waves were observed deleting sibling `.olean` files mid-run.
+_REPO_LAKE_LOCKS: dict[str, threading.Lock] = {}
+_REPO_LAKE_LOCKS_GUARD = threading.Lock()
+
+
+def _lake_lock_for(repo_root: Path) -> threading.Lock:
+    key = str(repo_root.resolve())
+    with _REPO_LAKE_LOCKS_GUARD:
+        lock = _REPO_LAKE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _REPO_LAKE_LOCKS[key] = lock
+        return lock
 
 _SORRY_WARNING_RE = re.compile(r":(\d+):\d+:\s*warning:\s*declaration uses '(?:sorry|admit)'")
 
@@ -148,13 +164,14 @@ class VSBLeanCompiler(AbstractLeanCompiler):
         tmp = repo_root / f"_blueprint_check_{abs(hash(lean_code)) % 1_000_000}.lean"
         try:
             tmp.write_text(full_lean, encoding="utf-8")
-            result = subprocess.run(
-                ["lake", "env", "lean", str(tmp)],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                timeout=BLUEPRINT_COMPILE_TIMEOUT,
-            )
+            with _lake_lock_for(repo_root):
+                result = subprocess.run(
+                    ["lake", "env", "lean", str(tmp)],
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=BLUEPRINT_COMPILE_TIMEOUT,
+                )
             combined = result.stdout + result.stderr
             errors = _extract_errors(combined)
             # sorry warnings are expected in blueprints — ignore them
@@ -230,13 +247,14 @@ class VSBLeanCompiler(AbstractLeanCompiler):
 
         try:
             tmp.write_text(content, encoding="utf-8")
-            result = subprocess.run(
-                ["lake", "env", "lean", str(tmp)],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
+            with _lake_lock_for(repo_root):
+                result = subprocess.run(
+                    ["lake", "env", "lean", str(tmp)],
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
             combined = result.stdout + result.stderr
             # Check for sorry/admit in OUR target declaration only. `local_ctx`
             # is the real file's preceding content and can itself contain

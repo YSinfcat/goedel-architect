@@ -80,10 +80,17 @@ class Turn:
 
 
 def default_reasoning_effort(model_id: str) -> str | None:
-    """The gpt-5/o1/o3/o4 -> "low" policy, shared by every backend (this is a
-    model-family decision, orthogonal to which wire format the backend uses)."""
+    """The gpt-5/o1/o3/o4 reasoning-effort policy, shared by every backend.
+
+    Override via GOEDEL_REASONING_EFFORT (none|low|medium|high|xhigh|max).
+    Default remains low to match prior cost/latency behavior. Returning the
+    string "none" (vs Python None) pins effort explicitly — needed on
+    gpt-5.6-sol tool turns where omitting the kwarg defaults to medium and
+    chat.completions then rejects tools + non-none effort.
+    """
+    import os
     if model_id.startswith("gpt-5") or model_id.startswith(("o1", "o3", "o4")):
-        return "low"
+        return os.environ.get("GOEDEL_REASONING_EFFORT", "low")
     return None
 
 
@@ -274,11 +281,13 @@ class ChatCompletionsBackend(ModelBackend):
         reply, and returns the resulting Turn. `start`/`continue_with` are
         both thin wrappers around this."""
         kwargs = _cc_tool_kwargs(tools, tool_choice)
-        # chat.completions rejects function tools + reasoning_effort together
-        # for gpt-5.x ("Function tools with reasoning_effort are not
-        # supported... Please use /v1/responses instead") - only apply
-        # reasoning_effort on tool-free turns.
-        if not tools:
+        # chat.completions rejects function tools + non-none reasoning_effort
+        # for gpt-5.x. gpt-5.6-sol defaults to medium when the kwarg is
+        # omitted, so tool turns must explicitly pin effort to "none".
+        if tools:
+            if self.model_id.startswith("gpt-5") or self.model_id.startswith(("o1", "o3", "o4")):
+                kwargs["reasoning_effort"] = "none"
+        else:
             kwargs.update(_cc_reasoning_kwargs(reasoning_effort))
         response = self.client.chat.completions.create(
             model=self.model_id, messages=messages, max_completion_tokens=max_tokens, **kwargs,
