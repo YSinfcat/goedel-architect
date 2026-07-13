@@ -409,7 +409,7 @@ def evaluate_theorem_phase(
                 checkpoint_path=checkpoint_path, compiler_factory=make_compiler,
                 retrieval=retrieval, repo_retrieval=repo_retrieval, model=model, tracer=tracer,
                 cascade_model=cascade_model, cascade_timeout_s=cascade_timeout_s,
-                escalation_max_tool_calls=escalation_max_tool_calls,
+                escalation_max_tool_calls=escalation_max_tool_calls, thm_name=thm_name,
             )
             result.update(
                 ok=True,

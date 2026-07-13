@@ -95,6 +95,7 @@ async def prove_dag(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
+    thm_name: str = "",
 ) -> OrchestratorResult:
     """
     Prove all nodes in the blueprint DAG in parallel waves.
@@ -204,6 +205,7 @@ async def prove_dag(
                 cascade_model=cascade_model,
                 cascade_timeout_s=cascade_timeout_s,
                 escalation_max_tool_calls=escalation_max_tool_calls,
+                thm_name=thm_name,
             )
             for name in wave
         ]
@@ -231,6 +233,7 @@ async def _prove_one(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = None,
+    thm_name: str = "",
 ) -> NodeResult:
     node = blueprint.node_by_name(name)
     assert node is not None
@@ -277,6 +280,7 @@ async def _prove_one(
                 repo_retrieval=repo_retrieval,
                 tracer=tracer,
                 max_tool_calls=max_tool_calls,
+                thm_name=thm_name,
             ),
         )
         try:

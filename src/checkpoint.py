@@ -24,7 +24,40 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from blueprint import Blueprint, _parse_blueprint
+from orchestrator import OrchestratorResult
 from prover import ProofSignal, ProverResult
+
+
+def _invalidate_stale_proofs(
+    new_blueprint: Blueprint,
+    proved_cache: dict[str, str],
+    proof_cache_keys: dict[str, str],
+) -> dict[str, str]:
+    """Drop cached proofs that no longer match the node they were compiled against.
+
+    proved_cache tracks nodes by NAME only. Refinement (Phase 3) can reuse a
+    node's name while restructuring its signature or dependency list (e.g.
+    splitting a hypothesis, changing its goal shape, adding a new
+    sorry_using [...] dependency) - the paper's rule only promises
+    SOLVED/FORMALLY_NEGATED nodes carry forward byte-identical, but nothing
+    enforces that, and a name collision with a differently-shaped node would
+    otherwise leave a proof compiled against the OLD shape marked "already
+    solved" forever, never recompiled against the new one.
+
+    Rather than diffing the immediately-previous blueprint (which misses a
+    node deleted at round N and reintroduced with a different shape at round
+    N+2 - neither adjacent diff N->N+1 or N+1->N+2 ever sees both shapes at
+    once), this compares against `proof_cache_keys[name]`: the exact
+    BlueprintNode.cache_key() recorded at the moment the proof was accepted.
+    A name missing from `proof_cache_keys` (e.g. an older checkpoint written
+    before this field existed) is treated as stale and re-checked once.
+    """
+    pruned = dict(proved_cache)
+    for name in list(pruned):
+        new_node = new_blueprint.node_by_name(name)
+        if new_node is None or proof_cache_keys.get(name) != new_node.cache_key():
+            del pruned[name]
+    return pruned
 
 
 @dataclass
@@ -40,7 +73,7 @@ class CheckpointState:
     # name -> BlueprintNode.cache_key() recorded at the moment the proof was
     # accepted into proved_cache. Lets a later refinement round tell whether
     # a cached proof still matches the node it was compiled against (see
-    # pipeline._invalidate_stale_proofs). Missing entries (e.g. a checkpoint
+    # _invalidate_stale_proofs below). Missing entries (e.g. a checkpoint
     # written before this field existed) are treated as stale on first use -
     # a safe, one-time re-check rather than trusting an unrecorded cache.
     proof_cache_keys: dict[str, str] = field(default_factory=dict)
@@ -50,12 +83,54 @@ class CheckpointState:
     done: bool = False
     success: bool = False
 
-    # -- Blueprint (de)serialization -------------------------------------
+    # -- Phase transitions --------------------------------------------------
+    #
+    # These are the only way to mutate phase-relevant state - an illegal
+    # field combination (e.g. node_results left stale against a just-refined
+    # blueprint) is then impossible to express instead of merely discouraged
+    # by comment.
 
-    def set_blueprint(self, blueprint: Blueprint) -> None:
+    def complete_phase1(self, blueprint: Blueprint) -> None:
         self.blueprint_lean_file = blueprint.lean_file
         self.blueprint_target = blueprint.target_theorem
         self.blueprint_fully_validated = blueprint.fully_validated
+
+    def complete_phase2(self, orch_result: OrchestratorResult, blueprint: Blueprint) -> None:
+        """Does not touch `iteration` - only Phase 3 (refinement) advances
+        the round counter; Phase 2 may be re-run in place (e.g. standalone
+        `--phase 2` invoked again before any refinement) without that
+        counting as a new round."""
+        for name, nr in orch_result.node_results.items():
+            if nr.result.signal == ProofSignal.SOLVED:
+                self.proved_cache[name] = nr.result.proof_body
+                node = blueprint.node_by_name(name)
+                if node:
+                    self.proof_cache_keys[name] = node.cache_key()
+        self.node_results = {
+            name: {
+                "signal": nr.result.signal.value,
+                "proof_body": nr.result.proof_body,
+                "analysis": nr.result.analysis,
+                "suggested_fix": nr.result.suggested_fix,
+                "lean_errors": nr.result.lean_errors,
+            }
+            for name, nr in orch_result.node_results.items()
+        }
+        self.done = orch_result.all_proved()
+        self.success = self.done
+
+    def complete_phase3(self, new_blueprint: Blueprint, refinement_history: list[str]) -> None:
+        self.complete_phase1(new_blueprint)
+        pruned = _invalidate_stale_proofs(new_blueprint, self.proved_cache, self.proof_cache_keys)
+        self.proved_cache = pruned
+        self.proof_cache_keys = {name: key for name, key in self.proof_cache_keys.items() if name in pruned}
+        self.refinement_history = list(refinement_history)
+        self.iteration += 1
+        self.node_results = {}  # stale against the new blueprint
+        self.done = False
+        self.success = False
+
+    # -- Blueprint (de)serialization -------------------------------------
 
     def get_blueprint(self) -> Blueprint | None:
         if not self.blueprint_lean_file:
@@ -65,19 +140,6 @@ class CheckpointState:
         return bp
 
     # -- Node results (de)serialization ----------------------------------
-
-    def set_node_results(self, node_results: dict) -> None:
-        """node_results: dict[str, NodeResult] as produced by orchestrator.prove_dag."""
-        self.node_results = {
-            name: {
-                "signal": nr.result.signal.value,
-                "proof_body": nr.result.proof_body,
-                "analysis": nr.result.analysis,
-                "suggested_fix": nr.result.suggested_fix,
-                "lean_errors": nr.result.lean_errors,
-            }
-            for name, nr in node_results.items()
-        }
 
     def get_prover_results(self) -> dict[str, ProverResult]:
         return {

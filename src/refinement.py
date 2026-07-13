@@ -15,10 +15,10 @@ from blueprint import (
     _call_with_repo_search,
     _extract_lean_code,
     _parse_blueprint,
-    _reasoning_kwargs,
     find_blueprint_cycle,
 )
 from lean_compiler import AbstractLeanCompiler
+from model_backend import ChatCompletionsBackend, default_reasoning_effort
 from orchestrator import OrchestratorResult
 from goedel_prompts import load, render
 from prover import ProofSignal
@@ -93,7 +93,8 @@ def refine_blueprint(
         change strategy or accept a node as an unresolved gap, rather than
         cosmetically re-decomposing the same stuck problem every round.
     """
-    client = make_client(model)
+    backend = ChatCompletionsBackend(make_client(model), model)
+    reasoning_effort = default_reasoning_effort(model)
 
     annotated_lean = _annotate_with_verdicts(blueprint, orch_result)
     if history is not None:
@@ -131,11 +132,10 @@ def refine_blueprint(
 
     last_error_feedback = ""
     for attempt in range(MAX_RETRIES):
-        response = _call_with_repo_search(
-            client, model, messages, repo_retrieval, _reasoning_kwargs(model), MAX_TOKENS,
+        content = _call_with_repo_search(
+            backend, messages, repo_retrieval, reasoning_effort, MAX_TOKENS,
             tracer=tracer, thm_name=thm_name, phase="phase3",
         )
-        content = response.choices[0].message.content
         lean_code = _extract_lean_code(content)
 
         result = compiler.check_blueprint(lean_code, blueprint.target_theorem)
@@ -146,7 +146,6 @@ def refine_blueprint(
                 if cycle:
                     print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: "
                           f"check_blueprint OK but invalid dependency structure - {cycle!r}", flush=True)
-                    messages.append({"role": "assistant", "content": content})
                     messages.append({
                         "role": "user",
                         "content": (
@@ -166,7 +165,6 @@ def refine_blueprint(
             # with no actual proof recorded, so this must be retried rather
             # than accepted (mirrors generate_blueprint's same guard).
             print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint OK but zero nodes, retrying", flush=True)
-            messages.append({"role": "assistant", "content": content})
             messages.append({
                 "role": "user",
                 "content": (
@@ -182,7 +180,6 @@ def refine_blueprint(
         last_error_feedback = error_feedback
         print(f"  [refine] attempt {attempt + 1}/{MAX_RETRIES}: check_blueprint FAILED - "
               f"{error_feedback[:300]!r}", flush=True)
-        messages.append({"role": "assistant", "content": content})
         messages.append({
             "role": "user",
             "content": (

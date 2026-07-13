@@ -10,8 +10,8 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from blueprint import _reasoning_kwargs
 from llm_client import make_client
+from model_backend import default_reasoning_effort
 
 PUTNAM_DIR = Path(__file__).parent.parent / "data" / "putnam"
 
@@ -50,6 +50,7 @@ def generate_nl_proof_sketch(informal_statement: str, model: str) -> str:
     if not informal_statement:
         return ""
     client = make_client(model)
+    effort = default_reasoning_effort(model)
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -57,7 +58,7 @@ def generate_nl_proof_sketch(informal_statement: str, model: str) -> str:
             {"role": "user", "content": informal_statement},
         ],
         max_completion_tokens=4096,
-        **_reasoning_kwargs(model),
+        **({"reasoning_effort": effort} if effort else {}),
     )
     return response.choices[0].message.content or ""
 

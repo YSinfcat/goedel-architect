@@ -6,6 +6,14 @@ Wires all three phases together and runs up to 8 refinement iterations
 The `compiler` parameter is injectable so the same pipeline works with:
   - LeanCompiler (standalone Lean projects via `lake env lean`)
   - VSBLeanCompiler (VeriSoftBench repos via LeanREPL)
+
+Each phase's real work (`_execute_phase1/2/3`) is shared between this
+module's all-in-one `prove_theorem` loop and the standalone `run_phase1/2/3`
+entry points below - both drive the exact same phase bodies against a
+`CheckpointState`, so a fix to one no longer risks leaving the other
+unfixed. `run_phase1/2/3`'s public signatures (`checkpoint_path: Path`) are
+unchanged from before - `eval/run_verisoftbench.py` depends on running each
+phase as a separate process against a checkpoint file on disk.
 """
 from __future__ import annotations
 
@@ -44,44 +52,110 @@ class ProofResult:
     failed_nodes: list[str] = field(default_factory=list)
 
 
-def _invalidate_stale_proofs(
-    new_blueprint: Blueprint,
-    proved_cache: dict[str, str],
-    proof_cache_keys: dict[str, str],
-) -> dict[str, str]:
-    """Drop cached proofs that no longer match the node they were compiled against.
-
-    proved_cache tracks nodes by NAME only. Refinement (Phase 3) can reuse a
-    node's name while restructuring its signature or dependency list (e.g.
-    splitting a hypothesis, changing its goal shape, adding a new
-    sorry_using [...] dependency) - the paper's rule only promises
-    SOLVED/FORMALLY_NEGATED nodes carry forward byte-identical, but nothing
-    enforces that, and a name collision with a differently-shaped node would
-    otherwise leave a proof compiled against the OLD shape marked "already
-    solved" forever, never recompiled against the new one.
-
-    Rather than diffing the immediately-previous blueprint (which misses a
-    node deleted at round N and reintroduced with a different shape at round
-    N+2 - neither adjacent diff N->N+1 or N+1->N+2 ever sees both shapes at
-    once), this compares against `proof_cache_keys[name]`: the exact
-    BlueprintNode.cache_key() recorded at the moment the proof was accepted.
-    A name missing from `proof_cache_keys` (e.g. an older checkpoint written
-    before this field existed) is treated as stale and re-checked once.
-    """
-    pruned = dict(proved_cache)
-    for name in list(pruned):
-        new_node = new_blueprint.node_by_name(name)
-        if new_node is None or proof_cache_keys.get(name) != new_node.cache_key():
-            del pruned[name]
-    return pruned
-
-
 def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_name: str) -> str:
     return "\n\n".join(
         f"{node.signature()} {proved_cache[node.name]}"
         for node in blueprint.dependency_order()
         if node.name != root_name and node.name in proved_cache
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase bodies - shared by prove_theorem's loop and the standalone
+# run_phase1/2/3 entry points below.
+# ---------------------------------------------------------------------------
+
+def _execute_phase1(
+    state: CheckpointState,
+    theorem_stmt: str,
+    nl_proof: str | None,
+    model: str,
+    compiler: AbstractLeanCompiler | None,
+    repo_context: str | None,
+    repo_retrieval,
+    tracer,
+    thm_name: str,
+) -> Blueprint:
+    blueprint = generate_blueprint(
+        theorem_stmt=theorem_stmt,
+        nl_proof=nl_proof,
+        model=model,
+        compiler=compiler,
+        repo_context=repo_context,
+        repo_retrieval=repo_retrieval,
+        tracer=tracer,
+        thm_name=thm_name,
+    )
+    state.complete_phase1(blueprint)
+    return blueprint
+
+
+def _execute_phase2(
+    state: CheckpointState,
+    blueprint: Blueprint,
+    compiler: AbstractLeanCompiler | None,
+    compiler_factory: Callable[[], AbstractLeanCompiler] | None,
+    retrieval: MathlibRetrieval,
+    repo_retrieval,
+    model: str,
+    tracer,
+    node_timeout_s: float | None,
+    cascade_model: str | None,
+    cascade_timeout_s: float | None,
+    escalation_max_tool_calls: int | None,
+    thm_name: str = "",
+) -> OrchestratorResult:
+    nodes_to_try = set(blueprint.nodes_by_name()) - set(state.proved_cache)
+    orch_result = asyncio.run(
+        prove_dag(
+            blueprint=blueprint,
+            compiler=compiler,
+            compiler_factory=compiler_factory,
+            retrieval=retrieval,
+            repo_retrieval=repo_retrieval,
+            model=model,
+            proved_cache=dict(state.proved_cache),
+            nodes_to_retry=nodes_to_try,
+            tracer=tracer,
+            node_timeout_s=node_timeout_s,
+            cascade_model=cascade_model,
+            cascade_timeout_s=cascade_timeout_s,
+            escalation_max_tool_calls=escalation_max_tool_calls,
+            thm_name=thm_name,
+        )
+    )
+    state.complete_phase2(orch_result, blueprint)
+    return orch_result
+
+
+def _execute_phase3(
+    state: CheckpointState,
+    blueprint: Blueprint,
+    orch_result: OrchestratorResult,
+    compiler: AbstractLeanCompiler,
+    model: str,
+    repo_context: str | None,
+    iteration: int,
+    max_iterations: int,
+    repo_retrieval,
+    tracer,
+    thm_name: str,
+) -> Blueprint:
+    new_blueprint = refine_blueprint(
+        blueprint=blueprint,
+        orch_result=orch_result,
+        compiler=compiler,
+        model=model,
+        repo_context=repo_context,
+        history=state.refinement_history,  # mutated in place, even on failure
+        iteration=iteration,
+        max_iterations=max_iterations,
+        repo_retrieval=repo_retrieval,
+        tracer=tracer,
+        thm_name=thm_name,
+    )
+    state.complete_phase3(new_blueprint, state.refinement_history)
+    return new_blueprint
 
 
 def prove_theorem(
@@ -169,12 +243,8 @@ def prove_theorem(
 
     if resumed_blueprint is not None:
         blueprint = resumed_blueprint
-        proved_cache: dict[str, str] = dict(state.proved_cache)
-        proof_cache_keys: dict[str, str] = dict(state.proof_cache_keys)
-        refinement_history: list[str] = list(state.refinement_history)
-        start_iteration = state.iteration
-        print(f"[Resume] loaded checkpoint at iteration {start_iteration + 1}, "
-              f"{len(proved_cache)} node(s) already proved", flush=True)
+        print(f"[Resume] loaded checkpoint at iteration {state.iteration + 1}, "
+              f"{len(state.proved_cache)} node(s) already proved", flush=True)
     else:
         # Phase 1: Blueprint generation
         # Don't use compiler_factory for blueprint validation: factory compilers are
@@ -182,71 +252,41 @@ def prove_theorem(
         # retries on type-signature errors the LLM can't fix without repo context.
         # Pass only an explicitly-shared compiler (e.g. standalone LeanCompiler).
         blueprint_compiler = compiler  # None when only compiler_factory is provided
-        blueprint = generate_blueprint(
-            theorem_stmt=theorem_stmt,
-            nl_proof=nl_proof,
-            model=phase1_model or model,
-            compiler=blueprint_compiler,
-            repo_context=repo_context,
-            repo_retrieval=repo_retrieval,
-            tracer=tracer,
-            thm_name=thm_name,
-        )
-        proved_cache = {}
-        proof_cache_keys = {}
-        refinement_history = []
-        start_iteration = 0
         state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
-        state.set_blueprint(blueprint)
+        blueprint = _execute_phase1(
+            state, theorem_stmt, nl_proof, phase1_model or model, blueprint_compiler,
+            repo_context, repo_retrieval, tracer, thm_name,
+        )
         if checkpoint_path:
             state.save(checkpoint_path)
 
     orch_result: OrchestratorResult | None = None
 
-    for iteration in range(start_iteration, max_iterations):
+    for iteration in range(state.iteration, max_iterations):
         # Phase 2: Parallel proving
-        nodes_to_try = set(blueprint.nodes_by_name()) - set(proved_cache)
+        nodes_to_try = set(blueprint.nodes_by_name()) - set(state.proved_cache)
         print(f"\n[Phase 2 iteration {iteration+1}] Proving {len(nodes_to_try)} nodes: {sorted(nodes_to_try)}", flush=True)
 
-        orch_result = asyncio.run(
-            prove_dag(
-                blueprint=blueprint,
-                compiler=compiler,
-                compiler_factory=compiler_factory,
-                retrieval=retrieval,
-                repo_retrieval=repo_retrieval,
-                model=model,
-                proved_cache=proved_cache,
-                nodes_to_retry=nodes_to_try,
-                tracer=tracer,
-                node_timeout_s=node_timeout_s,
-                cascade_model=cascade_model,
-                cascade_timeout_s=cascade_timeout_s,
-                escalation_max_tool_calls=escalation_max_tool_calls,
-            )
+        orch_result = _execute_phase2(
+            state, blueprint, compiler, compiler_factory, retrieval, repo_retrieval, model,
+            tracer, node_timeout_s, cascade_model, cascade_timeout_s, escalation_max_tool_calls,
+            thm_name=thm_name,
         )
+        state.iteration = iteration
 
         for name, nr in orch_result.node_results.items():
             status = nr.result.signal.value
             proof_preview = repr(nr.result.proof_body[:60]) if nr.result.proof_body else ""
             print(f"  node '{name}': {status} {proof_preview}", flush=True)
-            if status == "solved":
-                proved_cache[name] = nr.result.proof_body
-                node = blueprint.node_by_name(name)
-                if node:
-                    proof_cache_keys[name] = node.cache_key()
 
-        print(f"  proved so far: {sorted(proved_cache.keys())}", flush=True)
+        print(f"  proved so far: {sorted(state.proved_cache.keys())}", flush=True)
 
         if checkpoint_path:
-            state.iteration = iteration
-            state.proved_cache = dict(proved_cache)
-            state.proof_cache_keys = dict(proof_cache_keys)
-            state.set_node_results(orch_result.node_results)
+            state.save(checkpoint_path)
 
         if orch_result.all_proved():
             root_name = blueprint.target_theorem
-            root_proof = proved_cache.get(root_name, "")
+            root_proof = state.proved_cache.get(root_name, "")
             if checkpoint_path:
                 state.done = True
                 state.success = True
@@ -256,14 +296,11 @@ def prove_theorem(
                 theorem_name=root_name,
                 proof_body=root_proof,
                 final_lean_file=_assemble_final_file(blueprint, orch_result),
-                aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, root_name),
+                aux_lemma_decls=_aux_lemma_decls(blueprint, state.proved_cache, root_name),
                 iterations=iteration + 1,
                 proved_nodes=list(orch_result.proved),
                 failed_nodes=[],
             )
-
-        if checkpoint_path:
-            state.save(checkpoint_path)
 
         if iteration == max_iterations - 1:
             break
@@ -275,51 +312,35 @@ def prove_theorem(
         refinement_compiler = compiler or (compiler_factory() if compiler_factory else None)
         if refinement_compiler is None:
             break
+        proved_before = set(state.proved_cache)
         try:
-            blueprint = refine_blueprint(
-                blueprint=blueprint,
-                orch_result=orch_result,
-                compiler=refinement_compiler,
-                model=phase3_model or model,
-                repo_context=repo_context,
-                history=refinement_history,
-                iteration=iteration,
-                max_iterations=max_iterations,
-                repo_retrieval=repo_retrieval,
-                tracer=tracer,
-                thm_name=thm_name,
+            blueprint = _execute_phase3(
+                state, blueprint, orch_result, refinement_compiler, phase3_model or model,
+                repo_context, iteration, max_iterations, repo_retrieval, tracer, thm_name,
             )
             print(f"  new blueprint has {len(blueprint.nodes)} nodes: {[n.name for n in blueprint.nodes]}", flush=True)
         except RuntimeError as e:
             print(f"  refinement failed: {e}", flush=True)
-            # refine_blueprint mutates `history` in place before its own
-            # retry loop, so this round's attempt is already in memory even
-            # though refinement ultimately failed - persist it so the
-            # checkpoint's refinement_history isn't silently shorter than
-            # what was actually tried (matters for post-mortem diagnosis).
+            # refine_blueprint mutates state.refinement_history in place
+            # before its own retry loop, so this round's attempt is already
+            # recorded even though refinement ultimately failed - persisting
+            # here keeps the checkpoint's refinement_history from being
+            # silently shorter than what was actually tried (matters for
+            # post-mortem diagnosis).
             if checkpoint_path:
-                state.refinement_history = list(refinement_history)
                 state.save(checkpoint_path)
             break  # refinement failed, stop iterations
 
-        stale = set(proved_cache) - set(_invalidate_stale_proofs(blueprint, proved_cache, proof_cache_keys))
+        stale = proved_before - set(state.proved_cache)
         if stale:
             print(f"  invalidated stale proof(s) (no longer match the current node shape): {sorted(stale)}", flush=True)
-        proved_cache = _invalidate_stale_proofs(blueprint, proved_cache, proof_cache_keys)
-        proof_cache_keys = {name: key for name, key in proof_cache_keys.items() if name in proved_cache}
 
         if checkpoint_path:
-            state.set_blueprint(blueprint)
-            state.refinement_history = list(refinement_history)
-            state.iteration = iteration + 1
-            state.proved_cache = dict(proved_cache)
-            state.proof_cache_keys = dict(proof_cache_keys)
-            state.node_results = {}  # stale against the new blueprint
             state.save(checkpoint_path)
 
     proved = list(orch_result.proved) if orch_result else []
     failed = list(orch_result.failed.keys()) if orch_result else []
-    root_proof = proved_cache.get(blueprint.target_theorem, "")
+    root_proof = state.proved_cache.get(blueprint.target_theorem, "")
     if checkpoint_path:
         state.done = True
         state.success = False
@@ -328,8 +349,8 @@ def prove_theorem(
         success=False,
         theorem_name=blueprint.target_theorem,
         proof_body=root_proof,
-        final_lean_file=_assemble_partial_file(blueprint, orch_result, proved_cache),
-        aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, blueprint.target_theorem),
+        final_lean_file=_assemble_partial_file(blueprint, orch_result, state.proved_cache),
+        aux_lemma_decls=_aux_lemma_decls(blueprint, state.proved_cache, blueprint.target_theorem),
         iterations=max_iterations,
         proved_nodes=proved,
         failed_nodes=failed,
@@ -357,19 +378,11 @@ def run_phase1(
     thm_name: str = "",
 ) -> Blueprint:
     """Run Phase 1 (blueprint generation) alone and checkpoint the result."""
-    blueprint = generate_blueprint(
-        theorem_stmt=theorem_stmt,
-        nl_proof=nl_proof,
-        model=model,
-        compiler=compiler,
-        repo_context=repo_context,
-        repo_retrieval=repo_retrieval,
-        tracer=tracer,
-        thm_name=thm_name,
+    state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
+    blueprint = _execute_phase1(
+        state, theorem_stmt, nl_proof, model, compiler, repo_context, repo_retrieval, tracer, thm_name,
     )
     if checkpoint_path:
-        state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
-        state.set_blueprint(blueprint)
         state.save(checkpoint_path)
     return blueprint
 
@@ -386,6 +399,7 @@ def run_phase2(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
+    thm_name: str = "",
 ) -> OrchestratorResult:
     """Run one Phase 2 (parallel proving) pass against a checkpointed blueprint.
 
@@ -399,6 +413,10 @@ def run_phase2(
         (e.g. a strong blueprint-generation model) and Phase 2 with another
         (e.g. a cheaper per-node proving model) against the same checkpoint.
         Defaults to state.model when not given.
+    thm_name: the overall theorem's qualified name (e.g. "Hidden.Nat.mul_assoc"),
+        used only to detect a namespace-shadowed local type for each node's
+        prover (see prover._looks_namespace_shadowed) - optional, has no effect
+        on checkpointing or results structure.
     """
     state = CheckpointState.load(checkpoint_path)
     blueprint = state.get_blueprint()
@@ -406,40 +424,11 @@ def run_phase2(
         raise RuntimeError(f"No blueprint in checkpoint {checkpoint_path} — run Phase 1 first.")
 
     retrieval = retrieval or MathlibRetrieval()
-    proved_cache = dict(state.proved_cache)
-    proof_cache_keys = dict(state.proof_cache_keys)
-    nodes_to_try = set(blueprint.nodes_by_name()) - set(proved_cache)
-
-    orch_result = asyncio.run(
-        prove_dag(
-            blueprint=blueprint,
-            compiler=compiler,
-            compiler_factory=compiler_factory,
-            retrieval=retrieval,
-            repo_retrieval=repo_retrieval,
-            model=model or state.model,
-            proved_cache=proved_cache,
-            nodes_to_retry=nodes_to_try,
-            tracer=tracer,
-            node_timeout_s=node_timeout_s,
-            cascade_model=cascade_model,
-            cascade_timeout_s=cascade_timeout_s,
-            escalation_max_tool_calls=escalation_max_tool_calls,
-        )
+    orch_result = _execute_phase2(
+        state, blueprint, compiler, compiler_factory, retrieval, repo_retrieval,
+        model or state.model, tracer, node_timeout_s, cascade_model, cascade_timeout_s,
+        escalation_max_tool_calls, thm_name=thm_name,
     )
-
-    for name, nr in orch_result.node_results.items():
-        if nr.result.signal.value == "solved":
-            proved_cache[name] = nr.result.proof_body
-            node = blueprint.node_by_name(name)
-            if node:
-                proof_cache_keys[name] = node.cache_key()
-
-    state.proved_cache = proved_cache
-    state.proof_cache_keys = proof_cache_keys
-    state.set_node_results(orch_result.node_results)
-    state.done = orch_result.all_proved()
-    state.success = state.done
     state.save(checkpoint_path)
     return orch_result
 
@@ -482,32 +471,11 @@ def run_phase3(
     if orch_result.all_proved():
         raise RuntimeError(f"All nodes already proved in checkpoint {checkpoint_path} — nothing to refine.")
 
-    refinement_history = list(state.refinement_history)
-    new_blueprint = refine_blueprint(
-        blueprint=blueprint,
-        orch_result=orch_result,
-        compiler=compiler,
-        model=model or state.model,
-        repo_context=repo_context if repo_context is not None else state.repo_context,
-        history=refinement_history,
-        iteration=state.iteration,
-        max_iterations=max_iterations,
-        repo_retrieval=repo_retrieval,
-        tracer=tracer,
-        thm_name=thm_name,
+    new_blueprint = _execute_phase3(
+        state, blueprint, orch_result, compiler, model or state.model,
+        repo_context if repo_context is not None else state.repo_context,
+        state.iteration, max_iterations, repo_retrieval, tracer, thm_name,
     )
-
-    new_proved_cache = _invalidate_stale_proofs(new_blueprint, state.proved_cache, state.proof_cache_keys)
-    state.proved_cache = new_proved_cache
-    state.proof_cache_keys = {
-        name: key for name, key in state.proof_cache_keys.items() if name in new_proved_cache
-    }
-    state.set_blueprint(new_blueprint)
-    state.refinement_history = refinement_history
-    state.iteration += 1
-    state.node_results = {}  # stale against the new blueprint
-    state.done = False
-    state.success = False
     state.save(checkpoint_path)
     return new_blueprint
 

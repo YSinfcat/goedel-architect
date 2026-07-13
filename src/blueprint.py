@@ -5,24 +5,16 @@ and validates the resulting @[blueprint]-annotated Lean file via LeanArchitect.
 """
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from openai import OpenAI
-
-from lean_compiler import AbstractLeanCompiler, LeanCompiler, CompilerResult
+from lean_compiler import AbstractLeanCompiler, LeanCompiler
 from llm_client import make_client
+from model_backend import AUTO, ChatCompletionsBackend, ToolSpec, default_reasoning_effort
+from tool_dispatcher import ToolDispatcher, repo_search_handler
 from goedel_prompts import load, render
 from tracer import TraceEvent
-
-
-def _reasoning_kwargs(model: str) -> dict:
-    """Return reasoning_effort kwarg for models that support it (gpt-5.x series)."""
-    if model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3") or model.startswith("o4"):
-        return {"reasoning_effort": "low"}
-    return {}
 
 BLUEPRINT_SYSTEM_PROMPT = load("blueprint_system")
 BLUEPRINT_USER_TEMPLATE = load("blueprint_user")
@@ -41,25 +33,22 @@ MAX_RETRIES = 8
 # look up cross-file declarations on demand instead. Optional: passing
 # repo_retrieval=None (the default) reproduces the old no-tools behavior
 # exactly, so existing callers are unaffected.
-REPO_SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "repo_search",
-        "description": (
-            "Semantic search over the target repository's .lean files, "
-            "including files merely imported by (not textually preceding) "
-            "the theorem's own file."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Natural language or identifier fragment."},
-                "k": {"type": "integer", "description": "Number of results (default 10).", "default": 10},
-            },
-            "required": ["query"],
+REPO_SEARCH_TOOL = ToolSpec(
+    name="repo_search",
+    description=(
+        "Semantic search over the target repository's .lean files, "
+        "including files merely imported by (not textually preceding) "
+        "the theorem's own file."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Natural language or identifier fragment."},
+            "k": {"type": "integer", "description": "Number of results (default 10).", "default": 10},
         },
+        "required": ["query"],
     },
-}
+)
 
 # Bounds the extra repo_search back-and-forth before a call must produce a
 # final text response, separate from MAX_RETRIES (whole-attempt retries after
@@ -81,91 +70,62 @@ definition.
 """
 
 
-def _emit_usage(tracer, thm_name: str, phase: str, model: str, response) -> None:
-    """Log token usage from a chat.completions/responses API response, if a
-    tracer was given. `response.usage` is present on both APIs but with
-    different field names, so normalize to prompt/completion/total."""
-    if tracer is None:
+def _emit_usage(tracer, thm_name: str, phase: str, model: str, usage) -> None:
+    if tracer is None or usage is None:
         return
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return
-    prompt = getattr(usage, "prompt_tokens", None)
-    completion = getattr(usage, "completion_tokens", None)
-    if prompt is None:
-        prompt = getattr(usage, "input_tokens", 0)
-    if completion is None:
-        completion = getattr(usage, "output_tokens", 0)
-    total = getattr(usage, "total_tokens", None) or (prompt + completion)
     tracer.emit(TraceEvent(
         kind="llm_usage",
         thm_name=thm_name,
         args={
             "phase": phase, "model": model,
-            "prompt_tokens": prompt, "completion_tokens": completion,
-            "total_tokens": total,
+            "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
         },
     ))
 
 
 def _call_with_repo_search(
-    client: OpenAI,
-    model: str,
+    backend: ChatCompletionsBackend,
     messages: list[dict],
     repo_retrieval,
-    reasoning_kwargs: dict,
+    reasoning_effort: str | None,
     max_tokens: int,
     tracer=None,
     thm_name: str = "",
     phase: str = "",
-):
-    """chat.completions.create, transparently handling repo_search tool calls.
+) -> str:
+    """Drive one attempt through chat.completions, transparently handling
+    repo_search tool calls.
 
-    `messages` is mutated in place (tool round-trips appended) so the
-    caller's own subsequent messages (e.g. compile-error feedback) continue
-    to append correctly after this exchange, matching the existing retry
-    loops in generate_blueprint/refine_blueprint. Returns the first response
-    that isn't a tool-calls-only response.
+    `messages` is mutated in place (tool round-trips appended, and the
+    backend appends its own assistant replies as it goes) so the caller's
+    own subsequent messages (e.g. compile-error feedback) continue to append
+    correctly after this exchange, matching the existing retry loops in
+    generate_blueprint/refine_blueprint. Returns the final text response
+    (the caller no longer needs to append it - the backend already recorded
+    it in `messages`).
     """
-    tools = [REPO_SEARCH_TOOL] if repo_retrieval is not None else None
+    tools = [REPO_SEARCH_TOOL] if repo_retrieval is not None else []
+    dispatcher = ToolDispatcher({"repo_search": repo_search_handler(repo_retrieval)}) if repo_retrieval is not None else None
+
     for _ in range(MAX_SEARCH_TURNS):
-        # chat.completions rejects function tools + reasoning_effort together
-        # for gpt-5.x ("Function tools with reasoning_effort are not
-        # supported ... Please use /v1/responses instead") - drop
-        # reasoning_effort on tool-enabled turns; it still applies to the
-        # no-tools finalization call below (and to every call when
-        # repo_retrieval is None, unchanged from before this tool existed).
-        call_kwargs = {"tools": tools} if tools else dict(reasoning_kwargs)
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_completion_tokens=max_tokens,
-            **call_kwargs,
-        )
-        _emit_usage(tracer, thm_name, phase, model, response)
-        msg = response.choices[0].message
-        if not msg.tool_calls:
-            return response
-        messages.append({
-            "role": "assistant",
-            "content": msg.content,
-            "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
-        })
-        for tc in msg.tool_calls:
-            if tc.function.name == "repo_search":
-                args = json.loads(tc.function.arguments)
-                hits = repo_retrieval.search(args.get("query", ""), args.get("k", 10))
-                result = "\n\n".join(h.format() for h in hits) or "No results in repo."
-            else:
-                result = f"Tool unavailable: {tc.function.name}"
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+        turn = backend.call_raw(messages, tools, AUTO, max_tokens, reasoning_effort)
+        _emit_usage(tracer, thm_name, phase, backend.model_id, turn.usage)
+        if not turn.tool_calls:
+            return turn.text
+        # Every tool_call in this turn must get a matching reply before the
+        # next call.raw - a chat.completions request whose history contains
+        # an assistant message with an unanswered tool_call is rejected
+        # outright ("An assistant message with 'tool_calls' must be followed
+        # by tool messages responding to each 'tool_call_id'").
+        for tc in turn.tool_calls:
+            output = dispatcher.dispatch(tc.name, tc.args) if dispatcher else f"Tool unavailable: {tc.name}"
+            messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": output})
     # Exhausted search turns without a final text response - one last call
     # with tools withheld forces the model to commit to an answer.
-    response = client.chat.completions.create(
-        model=model, messages=messages, max_completion_tokens=max_tokens, **reasoning_kwargs,
-    )
-    _emit_usage(tracer, thm_name, phase, model, response)
-    return response
+    turn = backend.call_raw(messages, [], AUTO, max_tokens, reasoning_effort)
+    _emit_usage(tracer, thm_name, phase, backend.model_id, turn.usage)
+    return turn.text
 
 
 # Shared text-surgery helpers for the `@[blueprint]` grammar. Previously
@@ -277,7 +237,8 @@ def generate_blueprint(
         tool for cross-file lookups repo_context itself can't provide (see
         REPO_SEARCH_TOOL). Omit for the old no-tools behavior.
     """
-    client = make_client(model)
+    backend = ChatCompletionsBackend(make_client(model), model)
+    reasoning_effort = default_reasoning_effort(model)
 
     system_content = BLUEPRINT_SYSTEM_PROMPT
     if repo_retrieval is not None:
@@ -290,11 +251,11 @@ def generate_blueprint(
 
     last_lean_code = None
     for attempt in range(MAX_RETRIES):
-        response = _call_with_repo_search(
-            client, model, messages, repo_retrieval, _reasoning_kwargs(model), MAX_TOKENS,
+        content = _call_with_repo_search(
+            backend, messages, repo_retrieval, reasoning_effort, MAX_TOKENS,
             tracer=tracer, thm_name=thm_name, phase="phase1",
         )
-        lean_code = _extract_lean_code(response.choices[0].message.content)
+        lean_code = _extract_lean_code(content)
         last_lean_code = lean_code
 
         if compiler is not None:
@@ -305,7 +266,6 @@ def generate_blueprint(
                 if parsed.nodes:
                     cycle = find_blueprint_cycle(parsed)
                     if cycle:
-                        messages.append({"role": "assistant", "content": response.choices[0].message.content})
                         messages.append({
                             "role": "user",
                             "content": (
@@ -325,7 +285,6 @@ def generate_blueprint(
                 # Downstream, an empty node set makes all_proved() vacuously
                 # true with no actual proof recorded, so this must be retried
                 # rather than accepted as a usable blueprint.
-                messages.append({"role": "assistant", "content": response.choices[0].message.content})
                 messages.append({
                     "role": "user",
                     "content": (
@@ -339,7 +298,6 @@ def generate_blueprint(
                 continue
             # Feed errors back to the model for the next attempt
             error_feedback = "\n".join(result.errors) or result.raw_output[-2000:]
-            messages.append({"role": "assistant", "content": response.choices[0].message.content})
             messages.append({
                 "role": "user",
                 "content": (
@@ -361,7 +319,6 @@ def generate_blueprint(
             # vacuously true downstream with no actual proof recorded, so
             # this must be retried the same way the compiler branch already
             # retries its own zero-node case above.
-            messages.append({"role": "assistant", "content": response.choices[0].message.content})
             messages.append({
                 "role": "user",
                 "content": (
