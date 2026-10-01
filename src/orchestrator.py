@@ -14,6 +14,7 @@ from typing import Callable
 import networkx as nx
 
 from blueprint import Blueprint, BlueprintNode
+from budget import Budget, BudgetedCompiler
 from lean_compiler import AbstractLeanCompiler, format_proof_assign, normalize_proof_body
 from tactic_portfolio import run_tactic_portfolio
 from mathlib_retrieval import MathlibRetrieval
@@ -98,6 +99,7 @@ async def prove_dag(
     escalation_max_tool_calls: int | None = 1,
     enable_negation_probe: bool = False,
     tactic_portfolio: list[str] | None = None,
+    budget: Budget | None = None,
 ) -> OrchestratorResult:
     """
     Prove all nodes in the blueprint DAG in parallel waves.
@@ -225,6 +227,7 @@ async def prove_dag(
                 escalation_max_tool_calls=escalation_max_tool_calls,
                 enable_negation_probe=enable_negation_probe,
                 tactic_portfolio=tactic_portfolio,
+                budget=budget,
             )
             for name in wave
         ]
@@ -256,6 +259,7 @@ async def _prove_one(
     escalation_max_tool_calls: int | None = None,
     enable_negation_probe: bool = False,
     tactic_portfolio: list[str] | None = None,
+    budget: Budget | None = None,
 ) -> NodeResult:
     node = blueprint.node_by_name(name)
     assert node is not None
@@ -270,6 +274,12 @@ async def _prove_one(
     parent_proofs = {dep: proof_bodies[dep] for dep in ordered_deps}
     active_compiler = compiler_factory() if compiler_factory else compiler
     assert active_compiler is not None
+    # Budget accounting wraps every compiler path exactly once: the shared
+    # compiler is wrapped by the pipeline before it reaches prove_dag, so
+    # only factory-fresh instances (and a bare unwrapped one) get wrapped
+    # here - never both.
+    if budget is not None and not isinstance(active_compiler, BudgetedCompiler):
+        active_compiler = BudgetedCompiler(active_compiler, budget)
 
     # Proven dependencies are otherwise only shown to the model as prompt
     # text - re-declare them as real lemmas so `exact evalFuel_ret_sound h`
@@ -318,6 +328,9 @@ async def _prove_one(
         # the escalation its own instance.
         attempt_compiler = (compiler_factory() if fresh_compiler and compiler_factory
                             else active_compiler)
+        if budget is not None and attempt_compiler is not active_compiler \
+                and not isinstance(attempt_compiler, BudgetedCompiler):
+            attempt_compiler = BudgetedCompiler(attempt_compiler, budget)
         future = loop.run_in_executor(
             None,
             functools.partial(
@@ -336,6 +349,7 @@ async def _prove_one(
                 max_tool_calls=max_tool_calls,
                 enable_negation_probe=enable_negation_probe,
                 portfolio_failures=portfolio_failures or None,
+                budget=budget,
             ),
         )
         try:

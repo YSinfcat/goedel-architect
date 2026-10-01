@@ -11,6 +11,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from blueprint import _reasoning_kwargs
+from budget import Budget
+from eval_records import evaluation_record
 from llm_client import make_client
 from tactic_portfolio import DEFAULT_TACTIC_PORTFOLIO
 
@@ -20,7 +22,7 @@ PUTNAM_DIR = Path(__file__).parent.parent / "data" / "putnam"
 def _prove_in_subprocess(theorem_stmt, nl_proof, model, max_iterations, trace_path, queue,
                          allow_unvalidated_blueprint=False, enable_negation_probe=False,
                          retry_failed=False, tactic_portfolio=None,
-                         artifact_dir=None):
+                         artifact_dir=None, budget_kwargs=None):
     """Runs in a forked child process so a timeout can SIGKILL real work,
     not just abandon a thread that keeps burning API calls in the background.
     """
@@ -40,6 +42,7 @@ def _prove_in_subprocess(theorem_stmt, nl_proof, model, max_iterations, trace_pa
         retry_failed=retry_failed,
         tactic_portfolio=list(tactic_portfolio) if tactic_portfolio else None,
         artifact_dir=Path(artifact_dir) if artifact_dir else None,
+        budget=Budget(**(budget_kwargs or {})),
     )
     queue.put(result)
 
@@ -121,7 +124,13 @@ def main() -> None:
     parser.add_argument("--retry-failed", action="store_true",
                         help="Continue past a checkpointed terminal failure (done=True, "
                              "success=False) instead of returning the cached verdict forever.")
+    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--max-compile-calls", type=int, default=None)
+    parser.add_argument("--max-wall-time", type=float, default=None)
     args = parser.parse_args()
+    budget_kwargs = {"max_total_tokens": args.max_tokens,
+                     "max_compile_calls": args.max_compile_calls,
+                     "max_wall_time_s": args.max_wall_time}
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     problems = load_putnam()
@@ -170,7 +179,7 @@ def main() -> None:
                           args.allow_unvalidated_blueprint, args.enable_negation_probe,
                           args.retry_failed,
                           list(DEFAULT_TACTIC_PORTFOLIO) if args.tactic_portfolio else None,
-                          args.artifacts),
+                          args.artifacts, budget_kwargs),
                 )
                 proc.start()
                 proc.join(timeout=args.timeout)
@@ -202,14 +211,10 @@ def main() -> None:
                 result = None
 
             print(f"{status} ({elapsed:.1f}s)")
-            record = {
-                "name": name,
-                "status": status,
-                "elapsed_s": round(elapsed, 2),
-                "iterations": result.iterations if result else None,
-                "proved_nodes": result.proved_nodes if result else [],
-                "failed_nodes": result.failed_nodes if result else [],
-            }
+            record = evaluation_record(name, result, elapsed,
+                                       status=("SOLVED" if result and result.success
+                                               else "FAILED" if result else "ERROR"),
+                                       error=(status if result is None and status.startswith("ERROR") else None))
             out_f.write(json.dumps(record) + "\n")
             out_f.flush()
 

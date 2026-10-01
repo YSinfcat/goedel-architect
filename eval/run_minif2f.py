@@ -9,6 +9,8 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from budget import Budget
+from eval_records import evaluation_record
 from pipeline import prove_theorem, ProofResult
 from tactic_portfolio import DEFAULT_TACTIC_PORTFOLIO
 
@@ -55,6 +57,14 @@ def main() -> None:
     parser.add_argument("--retry-failed", action="store_true",
                         help="Continue past a checkpointed terminal failure (done=True, "
                              "success=False) instead of returning the cached verdict forever.")
+    parser.add_argument("--max-tokens", type=int, default=None,
+                        help="Per-problem total token ceiling; the run stops at the next "
+                             "iteration boundary when exceeded.")
+    parser.add_argument("--max-compile-calls", type=int, default=None,
+                        help="Per-problem Lean elaboration ceiling (node attempts, blueprint "
+                             "validations, and final verification all count).")
+    parser.add_argument("--max-wall-time", type=float, default=None,
+                        help="Per-problem wall-clock ceiling in seconds.")
     args = parser.parse_args()
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -83,6 +93,9 @@ def main() -> None:
                     tactic_portfolio=(list(DEFAULT_TACTIC_PORTFOLIO)
                                       if args.tactic_portfolio else None),
                     artifact_dir=Path(args.artifacts) if args.artifacts else None,
+                    budget=Budget(max_total_tokens=args.max_tokens,
+                                  max_compile_calls=args.max_compile_calls,
+                                  max_wall_time_s=args.max_wall_time),
                 )
                 elapsed = time.time() - t0
                 status = "SOLVED" if result.success else "FAILED"
@@ -94,14 +107,9 @@ def main() -> None:
                 result = None
 
             print(f"{status} ({elapsed:.1f}s)")
-            record = {
-                "name": name,
-                "status": status,
-                "elapsed_s": round(elapsed, 2),
-                "iterations": result.iterations if result else None,
-                "proved_nodes": result.proved_nodes if result else [],
-                "failed_nodes": result.failed_nodes if result else [],
-            }
+            record = evaluation_record(name, result, elapsed,
+                                       status=status,
+                                       error=(str(e) if result is None else None))
             out_f.write(json.dumps(record) + "\n")
             out_f.flush()
 

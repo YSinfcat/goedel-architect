@@ -19,6 +19,7 @@ from typing import Callable
 from blueprint import Blueprint, BlueprintValidationError, generate_blueprint, validate_blueprint
 from checkpoint import CheckpointState
 from artifacts import write_success_artifact
+from budget import Budget, BudgetedCompiler
 from interventions import autonomy_label
 from lineage import compute_lineage, lineage_snapshot
 from run_fingerprint import fingerprint, run_manifest, skip_requested
@@ -75,6 +76,9 @@ class ProofResult:
     final_verification: VerificationReport | None = None
     # fully_autonomous | human_guided | human_written (interventions.py)
     autonomy: str = "fully_autonomous"
+    # "token budget exhausted (...)" | "compile-call budget exhausted (...)" |
+    # "wall-time budget exhausted (...)" | "" (ran to completion)
+    stopped_reason: str = ""
 
 
 def _invalidate_stale_proofs(
@@ -309,6 +313,7 @@ async def prove_theorem_async(
     retry_failed: bool = False,
     tactic_portfolio: list[str] | None = None,
     artifact_dir: Path | None = None,
+    budget: Budget | None = None,
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -338,6 +343,12 @@ async def prove_theorem_async(
     if compiler is None and compiler_factory is None:
         root = project_root or Path(__file__).parent.parent / "goedel_lean"
         compiler = LeanCompiler(root)
+    # Budgeted exactly once here: final verification, blueprint validation,
+    # and per-node attempts through the SHARED compiler all count through
+    # this wrapper (factory-fresh compilers wrap inside prove_dag).
+    if budget is not None and compiler is not None \
+            and not isinstance(compiler, BudgetedCompiler):
+        compiler = BudgetedCompiler(compiler, budget)
 
     retrieval = retrieval or MathlibRetrieval()
 
@@ -494,6 +505,10 @@ async def prove_theorem_async(
         state.save(checkpoint_path)
 
     for iteration in range(start_iteration, max_iterations):
+        if budget is not None and budget.exhausted:
+            print(f"  [budget] stopping before iteration {iteration + 1}: "
+                  f"{budget.stop_reason} ({budget.report()})", flush=True)
+            break
         previous_round_nodes = list(blueprint.nodes)  # lineage baseline
         # Phase 2: Parallel proving
         nodes_to_try = _provable_nodes(blueprint) - set(proved_cache)
@@ -515,6 +530,7 @@ async def prove_theorem_async(
                 escalation_max_tool_calls=escalation_max_tool_calls,
                 enable_negation_probe=enable_negation_probe,
                 tactic_portfolio=tactic_portfolio,
+                budget=budget,
             )
 
         for name, nr in orch_result.node_results.items():
@@ -736,6 +752,7 @@ async def prove_theorem_async(
         failed_nodes=failed,
         final_verification=last_verification,
         autonomy=autonomy_label(state),
+        stopped_reason=(budget.stop_reason if budget is not None else ""),
     )
 
 
@@ -762,6 +779,7 @@ def prove_theorem(
     retry_failed: bool = False,
     tactic_portfolio: list[str] | None = None,
     artifact_dir: Path | None = None,
+    budget: Budget | None = None,
 ) -> ProofResult:
     """Synchronous wrapper around prove_theorem_async (review IV.5): the
     library no longer calls asyncio.run() deep inside a sync API, which
@@ -792,6 +810,7 @@ def prove_theorem(
         retry_failed=retry_failed,
         tactic_portfolio=tactic_portfolio,
         artifact_dir=artifact_dir,
+        budget=budget,
     ))
 
 

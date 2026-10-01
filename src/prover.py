@@ -234,8 +234,12 @@ class GoedelProver:
         api_timeout_s: float = 120.0,
         max_tool_calls: int | None = None,
         enable_negation_probe: bool = False,
+        budget=None,
     ):
         self.model_id = model_id
+        # Optional budget.Budget: token usage feeds it per API call so the
+        # pipeline can stop a run at a ceiling (review IV.6).
+        self.budget = budget
         # Bounds each individual chat.completions call so a stuck request
         # can't hang a node indefinitely; the orchestrator's node_timeout_s
         # bounds the whole multi-turn tool loop on top of this.
@@ -266,6 +270,8 @@ class GoedelProver:
         prompt = getattr(usage, "prompt_tokens", 0)
         completion = getattr(usage, "completion_tokens", 0)
         total = getattr(usage, "total_tokens", None) or (prompt + completion)
+        if self.budget is not None:
+            self.budget.spend_tokens(self.model_id, prompt, completion)
         self.tracer.emit(TraceEvent(
             kind="llm_usage",
             thm_name=node_name,
@@ -731,6 +737,7 @@ def prove_node(
     max_tool_calls: int | None = None,
     enable_negation_probe: bool = False,
     portfolio_failures: list[str] | None = None,
+    budget=None,
 ) -> ProverResult:
     parent_block = "\n\n".join(
         f"```lean\n-- {n}\n{p}\n```" for n, p in parent_proofs.items()
@@ -744,7 +751,8 @@ def prove_node(
     ) + _portfolio_note(portfolio_failures)
     prover = GoedelProver(model_id=model, retrieval=retrieval, tracer=tracer,
                            api_timeout_s=api_timeout_s, max_tool_calls=max_tool_calls,
-                           enable_negation_probe=enable_negation_probe)
+                           enable_negation_probe=enable_negation_probe,
+                           budget=budget)
     return prover.prove_node(
         compiler=compiler,
         node_name=node_name,
