@@ -4,3 +4,4 @@ __pycache__/
 .env
 results/
 goedel_lean/.lake/
+data/
