@@ -17,6 +17,7 @@ from typing import Callable
 
 from blueprint import Blueprint, BlueprintValidationError, generate_blueprint, validate_blueprint
 from checkpoint import CheckpointState
+from run_fingerprint import fingerprint, run_manifest, skip_requested
 from lean_compiler import (
     AbstractLeanCompiler,
     LeanCompiler,
@@ -237,6 +238,7 @@ def prove_theorem(
     escalation_max_tool_calls: int | None = 1,
     allow_unvalidated_blueprint: bool = False,
     enable_negation_probe: bool = False,
+    retry_failed: bool = False,
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -270,6 +272,30 @@ def prove_theorem(
     retrieval = retrieval or MathlibRetrieval()
 
     state = CheckpointState.load_or_none(checkpoint_path)
+
+    # Provenance: every checkpoint records the experiment identity (code
+    # commit, prompt hashes, toolchain, model/cascade config). Resume must
+    # not silently mix results across experiments - a mismatch refuses the
+    # checkpoint outright (GOEDEL_SKIP_FINGERPRINT=1 is the debug escape).
+    manifest = run_manifest(
+        model=model,
+        cascade_model=cascade_model,
+        max_iterations=max_iterations,
+        enable_negation_probe=enable_negation_probe,
+        allow_unvalidated_blueprint=allow_unvalidated_blueprint,
+    )
+    current_fingerprint = fingerprint(manifest)
+    if state is not None:
+        state.require_fingerprint(manifest, current_fingerprint)
+
+    if state and state.done and not state.success and retry_failed:
+        # A cached failure used to be terminal forever (done=True,
+        # success=False) - retry_failed lets a new model/config continue
+        # the same checkpoint instead of returning the stale verdict.
+        print("[Resume] retry_failed=True: ignoring cached failure, "
+              "continuing the run", flush=True)
+        state.done = False
+        state.success = False
 
     if state and state.theorem_stmt and state.theorem_stmt != theorem_stmt:
         # checkpoint_path is normally keyed by theorem name (see
@@ -367,6 +393,7 @@ def prove_theorem(
         _gate_blueprint(blueprint, allow_unvalidated=allow_unvalidated_blueprint,
                         had_compiler=blueprint_compiler is not None)
         state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
+        state.run_fingerprint = {**manifest, "fingerprint": current_fingerprint}
         state.set_blueprint(blueprint)
         if checkpoint_path:
             state.save(checkpoint_path)
@@ -577,8 +604,17 @@ def run_phase1(
     repo_retrieval=None,
     tracer=None,
     thm_name: str = "",
+    run_config: dict | None = None,
 ) -> Blueprint:
-    """Run Phase 1 (blueprint generation) alone and checkpoint the result."""
+    """Run Phase 1 (blueprint generation) alone and checkpoint the result.
+
+    run_config: the caller's pipeline configuration (cascade model,
+    max_iterations, negation-probe/blueprint-gate flags), recorded into
+    the checkpoint's run fingerprint so a later resume under the same
+    experiment matches. When omitted, a Phase-1-only manifest is recorded;
+    pass the SAME config you intend to resume with (see
+    run_verisoftbench's phase CLI) to avoid a fingerprint mismatch.
+    """
     blueprint = generate_blueprint(
         theorem_stmt=theorem_stmt,
         nl_proof=nl_proof,
@@ -590,7 +626,12 @@ def run_phase1(
         thm_name=thm_name,
     )
     if checkpoint_path:
+        manifest = run_config if run_config is not None else run_manifest(
+            model=model, cascade_model=None, max_iterations=None,
+            enable_negation_probe=False, allow_unvalidated_blueprint=False,
+        )
         state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
+        state.run_fingerprint = {**manifest, "fingerprint": fingerprint(manifest)}
         state.set_blueprint(blueprint)
         state.save(checkpoint_path)
     return blueprint

@@ -20,16 +20,26 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from blueprint import Blueprint, _parse_blueprint
 from prover import ProofSignal, ProverResult
 
 
+class CheckpointFingerprintError(ValueError):
+    """Resume refused: the checkpoint was produced by a different
+    code/prompt/config experiment (run fingerprint mismatch, or a legacy
+    checkpoint with no recorded fingerprint at all)."""
+
+
 @dataclass
 class CheckpointState:
-    theorem_stmt: str
+    # Schema 0 = checkpoints written before fingerprints existed (any file
+    # without this key on load). Schema 1 = records run_fingerprint and is
+    # subject to the resume fingerprint check.
+    schema_version: int = 1
+    theorem_stmt: str = ""
     model: str = "gpt-5.5"
     repo_context: str = ""
     iteration: int = 0
@@ -49,6 +59,9 @@ class CheckpointState:
     refinement_history: list[str] = field(default_factory=list)
     done: bool = False
     success: bool = False
+    # Provenance manifest (run_fingerprint.run_manifest) + its hash under
+    # "fingerprint". Empty dict = legacy schema-0 checkpoint.
+    run_fingerprint: dict = field(default_factory=dict)
 
     # -- Blueprint (de)serialization -------------------------------------
 
@@ -108,13 +121,55 @@ class CheckpointState:
     def load(cls, path: Path) -> "CheckpointState":
         with open(path) as f:
             data = json.load(f)
-        return cls(**data)
+        # Tolerate unknown keys: a checkpoint written by a newer schema (or
+        # a hand-edited one) must not crash an older reader - forward
+        # compatibility beats strict round-tripping here.
+        known = {fld.name for fld in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
     @classmethod
     def load_or_none(cls, path: Path | None) -> "CheckpointState | None":
         if path is None or not path.exists():
             return None
         return cls.load(path)
+
+    def require_fingerprint(self, manifest: dict, fingerprint: str) -> None:
+        """Refuse to reuse this checkpoint for a different experiment.
+
+        A legacy schema-0 checkpoint has no recorded fingerprint - its
+        provenance is unknowable, so it is treated as a mismatch rather
+        than silently trusted. Remediation is the caller's choice: delete
+        the checkpoint to recompute, or set GOEDEL_SKIP_FINGERPRINT=1 for
+        a local debugging resume (recorded in the manifest).
+        """
+        recorded = (self.run_fingerprint or {}).get("fingerprint", "")
+        if recorded == fingerprint:
+            return
+        from run_fingerprint import skip_requested
+        if skip_requested():
+            print("[Resume] fingerprint check skipped (GOEDEL_SKIP_FINGERPRINT=1)",
+                  flush=True)
+            return
+        if not recorded:
+            raise CheckpointFingerprintError(
+                f"Checkpoint has no run fingerprint (schema-0, written before "
+                f"provenance tracking) - refusing to resume it. Delete the "
+                f"checkpoint to recompute, or set GOEDEL_SKIP_FINGERPRINT=1 "
+                f"for a debugging resume."
+            )
+        recorded_manifest = self.run_fingerprint
+        diffs = [
+            f"{key}: checkpoint={recorded_manifest.get(key)!r} != current={manifest.get(key)!r}"
+            for key in sorted(set(manifest) | set(recorded_manifest) - {"fingerprint"})
+            if key != "fingerprint" and recorded_manifest.get(key) != manifest.get(key)
+        ]
+        raise CheckpointFingerprintError(
+            "Checkpoint was produced by a different experiment configuration "
+            f"(run fingerprint mismatch).\n  checkpoint: {recorded}\n  current:   {fingerprint}\n"
+            + ("\n".join(f"  {d}" for d in diffs[:6]))
+            + "\nDelete the checkpoint to recompute, or set GOEDEL_SKIP_FINGERPRINT=1 "
+              "for a debugging resume."
+        )
 
 
 def path_for_theorem(checkpoint_dir: Path, thm_name: str) -> Path:

@@ -19,6 +19,9 @@ def summarize(path: str) -> None:
     solved = status_counts.get("SOLVED", 0)
 
     print(f"Results from: {path}")
+    if total == 0:
+        print("  (no records - empty or all-blank JSONL)")
+        return
     print(f"  Total:  {total}")
     print(f"  Solved: {solved} ({100*solved/total:.1f}%)")
     print(f"  Failed: {status_counts.get('FAILED', 0)}")

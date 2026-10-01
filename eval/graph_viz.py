@@ -349,10 +349,24 @@ DATA.forEach((thm, i) => {
   const div = document.createElement('div');
   div.className = 'thm-item';
   div.dataset.idx = i;
-  div.innerHTML =
-    `<span class="badge ${thm.ok ? 'pass' : 'fail'}">${thm.ok ? 'PASS' : 'FAIL'}</span>` +
-    `<div><div class="thm-label" title="${thm.thm_name}">${thm.thm_name.split('.').pop()}</div>` +
-    `<div class="thm-meta">${thm.lean_root} · ${thm.tool_calls_used} calls</div></div>`;
+  // Built with textContent assignments, not innerHTML: thm_name/lean_root
+  // come from trace data ultimately controlled by model output, and an
+  // innerHTML template would let a crafted name inject markup.
+  const badge = document.createElement('span');
+  badge.className = 'badge ' + (thm.ok ? 'pass' : 'fail');
+  badge.textContent = thm.ok ? 'PASS' : 'FAIL';
+  const label = document.createElement('div');
+  label.className = 'thm-label';
+  label.title = thm.thm_name;
+  label.textContent = thm.thm_name.split('.').pop();
+  const meta = document.createElement('div');
+  meta.className = 'thm-meta';
+  meta.textContent = thm.lean_root + ' · ' + thm.tool_calls_used + ' calls';
+  const wrap = document.createElement('div');
+  wrap.appendChild(label);
+  wrap.appendChild(meta);
+  div.appendChild(badge);
+  div.appendChild(wrap);
   div.addEventListener('click', () => loadThm(i, div));
   thmList.appendChild(div);
 });
@@ -459,6 +473,16 @@ def generate(trace_path: Path | str, output_path: Path | str | None = None) -> P
     theorem_data.sort(key=lambda t: (not t["ok"], t["thm_name"]))
 
     data_json = json.dumps(theorem_data, ensure_ascii=False, indent=None)
+    # JSON-in-<script> embedding: a model-generated string containing
+    # `</script>` (or U+2028/29, illegal in JS string literals) would
+    # otherwise break out of the script tag or the parse. Escape exactly
+    # the characters that matter, after JSON encoding.
+    data_json = (data_json
+                 .replace("<", "\\u003c")
+                 .replace(">", "\\u003e")
+                 .replace("&", "\\u0026")
+                 .replace("\u2028", "\\u2028")
+                 .replace("\u2029", "\\u2029"))
     html = HTML_TEMPLATE.replace("__DATA__", data_json)
     output_path.write_text(html, encoding="utf-8")
     return output_path

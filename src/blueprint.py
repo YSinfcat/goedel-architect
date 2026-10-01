@@ -178,7 +178,15 @@ def _call_with_repo_search(
         })
         for tc in msg.tool_calls:
             if tc.function.name == "repo_search":
-                args = json.loads(tc.function.arguments)
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                    if not isinstance(args, dict):
+                        args = {}
+                except (json.JSONDecodeError, TypeError) as exc:
+                    result = (f"repo_search arguments were not valid JSON ({exc}). "
+                              "Re-call repo_search with valid JSON arguments.")
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                    continue
                 hits = repo_retrieval.search(args.get("query", ""), args.get("k", 10))
                 result = "\n\n".join(h.format() for h in hits) or "No results in repo."
             else:

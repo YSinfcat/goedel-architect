@@ -44,6 +44,9 @@ def main() -> None:
     parser.add_argument("--enable-negation-probe", action="store_true",
                         help="Enable the experimental FORMALLY_NEGATED probe (known flaw: it "
                              "never compiles a real negated goal - treat its output as advisory).")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="Continue past a checkpointed terminal failure (done=True, "
+                             "success=False) instead of returning the cached verdict forever.")
     args = parser.parse_args()
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -68,6 +71,7 @@ def main() -> None:
                     max_iterations=args.max_iterations,
                     allow_unvalidated_blueprint=args.allow_unvalidated_blueprint,
                     enable_negation_probe=args.enable_negation_probe,
+                    retry_failed=args.retry_failed,
                 )
                 elapsed = time.time() - t0
                 status = "SOLVED" if result.success else "FAILED"
