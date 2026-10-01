@@ -143,6 +143,8 @@ def write_success_artifact(
         (out / "lineage.json").write_text(
             json.dumps(lineage_history, indent=2, ensure_ascii=False),
             encoding="utf-8")
+    if trace_path is not None and Path(trace_path).exists():
+        shutil.copyfile(trace_path, out / "trace.jsonl")
 
     readme = f"""# Proof artifact: {theorem_name}
 
@@ -162,6 +164,7 @@ Contents:
 - run_manifest.json        code commit, prompt hashes, model config
 - model_usage.json         token totals from the run's trace
 - lineage.json             per-round node lineage (ids, edits, splits)
+- trace.jsonl              the run's event trace (when available)
 """
     (out / "README.md").write_text(readme, encoding="utf-8")
     return out
