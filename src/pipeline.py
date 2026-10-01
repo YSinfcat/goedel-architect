@@ -264,6 +264,7 @@ async def prove_theorem_async(
     allow_unvalidated_blueprint: bool = False,
     enable_negation_probe: bool = False,
     retry_failed: bool = False,
+    tactic_portfolio: list[str] | None = None,
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -308,6 +309,7 @@ async def prove_theorem_async(
         max_iterations=max_iterations,
         enable_negation_probe=enable_negation_probe,
         allow_unvalidated_blueprint=allow_unvalidated_blueprint,
+        tactic_portfolio=list(tactic_portfolio) if tactic_portfolio else None,
     )
     current_fingerprint = fingerprint(manifest)
     if state is not None:
@@ -454,6 +456,7 @@ async def prove_theorem_async(
                 cascade_timeout_s=cascade_timeout_s,
                 escalation_max_tool_calls=escalation_max_tool_calls,
                 enable_negation_probe=enable_negation_probe,
+                tactic_portfolio=tactic_portfolio,
             )
 
         for name, nr in orch_result.node_results.items():
@@ -670,6 +673,7 @@ def prove_theorem(
     allow_unvalidated_blueprint: bool = False,
     enable_negation_probe: bool = False,
     retry_failed: bool = False,
+    tactic_portfolio: list[str] | None = None,
 ) -> ProofResult:
     """Synchronous wrapper around prove_theorem_async (review IV.5): the
     library no longer calls asyncio.run() deep inside a sync API, which
@@ -698,6 +702,7 @@ def prove_theorem(
         allow_unvalidated_blueprint=allow_unvalidated_blueprint,
         enable_negation_probe=enable_negation_probe,
         retry_failed=retry_failed,
+        tactic_portfolio=tactic_portfolio,
     ))
 
 
@@ -765,6 +770,7 @@ async def run_phase2_async(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
+    tactic_portfolio: list[str] | None = None,
 ) -> OrchestratorResult:
     """Run one Phase 2 (parallel proving) pass against a checkpointed blueprint.
 
@@ -806,6 +812,7 @@ async def run_phase2_async(
             cascade_model=cascade_model,
             cascade_timeout_s=cascade_timeout_s,
             escalation_max_tool_calls=escalation_max_tool_calls,
+            tactic_portfolio=tactic_portfolio,
         )
 
     for name, nr in orch_result.node_results.items():
@@ -850,6 +857,7 @@ def run_phase2(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
+    tactic_portfolio: list[str] | None = None,
 ) -> OrchestratorResult:
     """Synchronous wrapper around run_phase2_async (see prove_theorem)."""
     return asyncio.run(run_phase2_async(
@@ -864,6 +872,7 @@ def run_phase2(
         cascade_model=cascade_model,
         cascade_timeout_s=cascade_timeout_s,
         escalation_max_tool_calls=escalation_max_tool_calls,
+        tactic_portfolio=tactic_portfolio,
     ))
 
 

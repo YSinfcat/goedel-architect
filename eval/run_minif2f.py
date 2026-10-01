@@ -10,6 +10,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from pipeline import prove_theorem, ProofResult
+from tactic_portfolio import DEFAULT_TACTIC_PORTFOLIO
 
 MINIF2F_DIR = Path(__file__).parent.parent / "data" / "minif2f"
 
@@ -44,6 +45,10 @@ def main() -> None:
     parser.add_argument("--enable-negation-probe", action="store_true",
                         help="Enable the experimental FORMALLY_NEGATED probe (known flaw: it "
                              "never compiles a real negated goal - treat its output as advisory).")
+    parser.add_argument("--tactic-portfolio", action="store_true",
+                        help="Try a deterministic tactic list (simp/aesop/omega/...) "
+                             "on each node before any model call - a hit costs zero "
+                             "LLM tokens. Recorded in the run fingerprint.")
     parser.add_argument("--retry-failed", action="store_true",
                         help="Continue past a checkpointed terminal failure (done=True, "
                              "success=False) instead of returning the cached verdict forever.")
@@ -72,6 +77,8 @@ def main() -> None:
                     allow_unvalidated_blueprint=args.allow_unvalidated_blueprint,
                     enable_negation_probe=args.enable_negation_probe,
                     retry_failed=args.retry_failed,
+                    tactic_portfolio=(list(DEFAULT_TACTIC_PORTFOLIO)
+                                      if args.tactic_portfolio else None),
                 )
                 elapsed = time.time() - t0
                 status = "SOLVED" if result.success else "FAILED"

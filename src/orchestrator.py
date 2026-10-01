@@ -15,6 +15,7 @@ import networkx as nx
 
 from blueprint import Blueprint, BlueprintNode
 from lean_compiler import AbstractLeanCompiler, format_proof_assign, normalize_proof_body
+from tactic_portfolio import run_tactic_portfolio
 from mathlib_retrieval import MathlibRetrieval
 from prover import ProofSignal, ProverResult, prove_node
 from tracer import NullTracer
@@ -96,6 +97,7 @@ async def prove_dag(
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
     enable_negation_probe: bool = False,
+    tactic_portfolio: list[str] | None = None,
 ) -> OrchestratorResult:
     """
     Prove all nodes in the blueprint DAG in parallel waves.
@@ -222,6 +224,7 @@ async def prove_dag(
                 cascade_timeout_s=cascade_timeout_s,
                 escalation_max_tool_calls=escalation_max_tool_calls,
                 enable_negation_probe=enable_negation_probe,
+                tactic_portfolio=tactic_portfolio,
             )
             for name in wave
         ]
@@ -252,6 +255,7 @@ async def _prove_one(
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = None,
     enable_negation_probe: bool = False,
+    tactic_portfolio: list[str] | None = None,
 ) -> NodeResult:
     node = blueprint.node_by_name(name)
     assert node is not None
@@ -285,6 +289,19 @@ async def _prove_one(
     parent_lemma_decls = "\n\n".join(
         part for part in (definition_decls, proved_lemma_decls) if part
     )
+
+    # Deterministic first shot (review IV.5): try the cheap tactic list
+    # through the same compile contract the prover uses; a hit closes the
+    # node with zero model calls and never touches the cascade budget.
+    if tactic_portfolio:
+        portfolio_result = run_tactic_portfolio(
+            active_compiler, node.lean_declaration, parent_lemma_decls, name,
+            tactics=tuple(tactic_portfolio), tracer=tracer,
+        )
+        if portfolio_result is not None:
+            print(f"    [node {name}] closed by tactic portfolio "
+                  f"({portfolio_result.proof_body}) - no model call", flush=True)
+            return NodeResult(node=node, result=portfolio_result)
 
     async def attempt(
         use_model: str, timeout_s: float | None, max_tool_calls: int | None = None,

@@ -12,18 +12,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from blueprint import _reasoning_kwargs
 from llm_client import make_client
+from tactic_portfolio import DEFAULT_TACTIC_PORTFOLIO
 
 PUTNAM_DIR = Path(__file__).parent.parent / "data" / "putnam"
 
 
 def _prove_in_subprocess(theorem_stmt, nl_proof, model, max_iterations, trace_path, queue,
                          allow_unvalidated_blueprint=False, enable_negation_probe=False,
-                         retry_failed=False):
+                         retry_failed=False, tactic_portfolio=None):
     """Runs in a forked child process so a timeout can SIGKILL real work,
     not just abandon a thread that keeps burning API calls in the background.
     """
     sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
     from pipeline import prove_theorem
+    from tactic_portfolio import DEFAULT_TACTIC_PORTFOLIO
     from tracer import JsonlTracer, NullTracer
     tracer = JsonlTracer(trace_path) if trace_path else NullTracer()
     result = prove_theorem(
@@ -35,6 +37,7 @@ def _prove_in_subprocess(theorem_stmt, nl_proof, model, max_iterations, trace_pa
         allow_unvalidated_blueprint=allow_unvalidated_blueprint,
         enable_negation_probe=enable_negation_probe,
         retry_failed=retry_failed,
+        tactic_portfolio=list(tactic_portfolio) if tactic_portfolio else None,
     )
     queue.put(result)
 
@@ -106,6 +109,10 @@ def main() -> None:
     parser.add_argument("--enable-negation-probe", action="store_true",
                         help="Enable the experimental FORMALLY_NEGATED probe (known flaw: it "
                              "never compiles a real negated goal - treat its output as advisory).")
+    parser.add_argument("--tactic-portfolio", action="store_true",
+                        help="Try a deterministic tactic list (simp/aesop/omega/...) "
+                             "on each node before any model call - a hit costs zero "
+                             "LLM tokens. Recorded in the run fingerprint.")
     parser.add_argument("--retry-failed", action="store_true",
                         help="Continue past a checkpointed terminal failure (done=True, "
                              "success=False) instead of returning the cached verdict forever.")
@@ -156,7 +163,8 @@ def main() -> None:
                     target=_prove_in_subprocess,
                     args=(stmt, nl_proof, args.model, args.max_iterations, problem_trace_path, queue,
                           args.allow_unvalidated_blueprint, args.enable_negation_probe,
-                          args.retry_failed),
+                          args.retry_failed,
+                          list(DEFAULT_TACTIC_PORTFOLIO) if args.tactic_portfolio else None),
                 )
                 proc.start()
                 proc.join(timeout=args.timeout)

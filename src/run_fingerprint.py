@@ -95,6 +95,7 @@ def run_manifest(
     max_iterations: int | None = None,
     enable_negation_probe: bool = False,
     allow_unvalidated_blueprint: bool = False,
+    tactic_portfolio: list[str] | None = None,
     provider_base_urls: dict[str, str] | None = None,
 ) -> dict:
     """The full provenance manifest for one prove_theorem configuration."""
@@ -111,6 +112,7 @@ def run_manifest(
             "max_iterations": max_iterations,
             "enable_negation_probe": enable_negation_probe,
             "allow_unvalidated_blueprint": allow_unvalidated_blueprint,
+            "tactic_portfolio": tactic_portfolio,
         },
         "provider_base_urls": provider_base_urls or {},
         "fingerprint_skip": skip_requested(),
