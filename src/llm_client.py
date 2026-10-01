@@ -22,6 +22,8 @@ from pathlib import Path
 
 from openai import OpenAI
 
+from responses_adapter import ResponsesAdapterClient
+
 REPO_ROOT = Path(__file__).parent.parent
 
 # provider id -> routing config. `chat_only` providers have no Responses
@@ -44,8 +46,11 @@ PROVIDER_REGISTRY: dict[str, dict] = {
     # Any other OpenAI-COMPATIBLE endpoint (DeepSeek, Together, a local
     # vLLM/gateway, ...): set GOEDEL_BASE_URL and GOEDEL_API_KEY in .env
     # and every model id routes there unless it matches a prefix above.
+    # GOEDEL_SESSION_ID optionally adds a routing header some gateways
+    # require (e.g. OpenCode GO's x-opencode-session).
     "custom": {"prefix": "\x00", "base_url_env": "GOEDEL_BASE_URL",
-               "api_key_env": "GOEDEL_API_KEY", "chat_only": False},
+               "api_key_env": "GOEDEL_API_KEY", "chat_only": False,
+               "session_header": "x-opencode-session", "session_env": "GOEDEL_SESSION_ID"},
 }
 
 _CLIENT_CACHE: dict[tuple[str, float | None], OpenAI] = {}
@@ -86,12 +91,13 @@ def make_client(model_id: str, timeout: float | None = None) -> OpenAI:
     # GOEDEL_BASE_URL/GOEDEL_API_KEY activate the custom OpenAI-compatible
     # endpoint for any model id that doesn't match an explicit prefix.
     custom_url = os.environ.get("GOEDEL_BASE_URL", "").strip()
+    api_style = os.environ.get("GOEDEL_API_STYLE", "chat").strip()
     if custom_url and custom_url != "\x00":
         cfg = PROVIDER_REGISTRY["custom"]
         provider = "custom"
     else:
         provider, cfg = provider_for(model_id)
-    key = (provider, timeout)
+    key = (provider, timeout, api_style)
     with _CLIENT_CACHE_LOCK:
         cached = _CLIENT_CACHE.get(key)
         if cached is not None:
@@ -101,7 +107,15 @@ def make_client(model_id: str, timeout: float | None = None) -> OpenAI:
         if base_url:
             kwargs["base_url"] = base_url
             kwargs["api_key"] = os.environ[cfg["api_key_env"]]
+            session = os.environ.get(cfg.get("session_env", ""), "").strip()
+            if cfg.get("session_header") and session:
+                kwargs["default_headers"] = {cfg["session_header"]: session}
         client = OpenAI(**kwargs)
+        # GOEDEL_API_STYLE=responses: the gateway exposes this model only
+        # through the Responses API (e.g. OpenCode GO's gpt-6-luna) - wrap
+        # it so the chat.completions call sites keep working unchanged.
+        if provider == "custom" and api_style == "responses":
+            client = ResponsesAdapterClient(client)
         _CLIENT_CACHE[key] = client
         return client
 

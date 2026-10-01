@@ -83,24 +83,26 @@ class TestHumanProofThroughPipeline(unittest.TestCase):
     def test_human_proof_still_requires_final_verification(self):
         # A human-set proof flows through the SAME success criterion: with
         # a verifier that rejects everything, the run must NOT succeed.
+        import blueprint as bp_mod
         import llm_client
         import pipeline
-        from openai import OpenAI
+        import prover as prover_mod
+        import refinement as ref_mod
+        # Hide the developer's live gateway config so nothing routes
+        # through the real custom endpoint during this test.
+        godel_env = {k: os.environ.pop(k, None) for k in
+                     ("GOEDEL_BASE_URL", "GOEDEL_API_KEY",
+                      "GOEDEL_API_STYLE", "GOEDEL_SESSION_ID")}
+        llm_client._CLIENT_CACHE.clear()
         bp = _parse_blueprint(LEAN, "main")
         bp.fully_validated = True
-        old_gen, old_client = pipeline.generate_blueprint, llm_client.make_client
+        old_gen = pipeline.generate_blueprint
         pipeline.generate_blueprint = lambda **kw: bp
-        # The OpenAI class is imported by llm_client at module load time;
-        # monkeypatching it directly here stops both refinement and proof
-        # from ever issuing a real request - the make_client cache in
-        # llm_client was cleared by previous tests in the suite so we
-        # also patch the cached getter.
+        # Each caller module holds its own `from llm_client import
+        # make_client` reference - patch all three call sites' modules
+        # (blueprint, refinement, prover) instead of the OpenAI class.
         class _StubCompletions:
             def create(self, **kw):
-                # Return an empty-but-valid choices list so blueprint
-                # generation/parsing logic sees a real response shape and
-                # falls through its own empty-content path instead of
-                # IndexError-ing on choices[0].
                 class _Msg:
                     content = ""
                     tool_calls = None
@@ -114,25 +116,13 @@ class TestHumanProofThroughPipeline(unittest.TestCase):
             completions = _StubCompletions()
         class _StubClient:
             chat = _StubChat
-        # Capture and replace OpenAI.__init__ ONLY for this method.
-        # The OpenAI __init__ body normally reads OPENAI_API_KEY and calls
-        # BaseClient.post_init which raises "Missing credentials" without
-        # one. We replace it with a function that stores the kwargs on the
-        # instance and skips post_init - just enough that make_client's
-        # type checks succeed and no network call is made.
-        orig_init = OpenAI.__init__
-
-        def _safe_init(self, *args, **kwargs):
-            # Stash the kwargs we'd normally consume, skip the network
-            # setup. Provides the minimum interface make_client callers
-            # rely on (chat.completions.create, via the helper class
-            # below). Tests that need a richer interface should replace
-            # the entire OpenAI subclass.
-            self.__dict__.update(kwargs)
-            self.chat = _StubChat
-
-        OpenAI.__init__ = _safe_init
-        llm_client._CLIENT_CACHE.clear()
+        _stub_factory = lambda model, timeout=None: _StubClient()
+        old_bp_mc, old_ref_mc, old_prover_mc = (bp_mod.make_client,
+                                                ref_mod.make_client,
+                                                prover_mod.make_client)
+        bp_mod.make_client = _stub_factory
+        ref_mod.make_client = _stub_factory
+        prover_mod.make_client = _stub_factory
         try:
             with tempfile.TemporaryDirectory() as d:
                 ckpt = Path(d) / "ckpt.json"
@@ -159,8 +149,13 @@ class TestHumanProofThroughPipeline(unittest.TestCase):
                 self.assertEqual(result.autonomy, "human_written")
         finally:
             pipeline.generate_blueprint = old_gen
-            OpenAI.__init__ = orig_init
+            bp_mod.make_client = old_bp_mc
+            ref_mod.make_client = old_ref_mc
+            prover_mod.make_client = old_prover_mc
             llm_client._CLIENT_CACHE.clear()
+            for k, v in godel_env.items():
+                if v is not None:
+                    os.environ[k] = v
 
     def test_status_lists_everything(self):
         s = _state()

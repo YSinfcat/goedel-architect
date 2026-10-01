@@ -134,9 +134,38 @@ class TestCreateWithRetry(unittest.TestCase):
         self.assertLess(self.sleeper.delays[1], self.sleeper.delays[2])
 
 
+_GOEDEL_ENV = ("GOEDEL_BASE_URL", "GOEDEL_API_KEY", "GOEDEL_API_STYLE",
+               "GOEDEL_SESSION_ID")
+
+
+class _HermeticGodelEnv:
+    """Temporarily hide any real .env GOEDEL_* settings so provider tests
+    exercise the registry, not the developer's live gateway config."""
+
+    def __enter__(self):
+        # Mark .env loading as done BEFORE popping: otherwise the first
+        # make_client in the test would trigger _load_env_once and reload
+        # the live .env right back into os.environ.
+        llm_client._load_env_once._done = True  # type: ignore[attr-defined]
+        self._saved = {k: os.environ.pop(k, None) for k in _GOEDEL_ENV}
+        llm_client._CLIENT_CACHE.clear()
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self._saved.items():
+            if v is not None:
+                os.environ[k] = v
+        llm_client._CLIENT_CACHE.clear()
+
+
 class TestClientCache(unittest.TestCase):
     def setUp(self):
+        self._env = _HermeticGodelEnv()
+        self._env.__enter__()
         llm_client._CLIENT_CACHE.clear()
+
+    def tearDown(self):
+        self._env.__exit__(None, None, None)
 
     def test_same_model_and_timeout_share_a_client(self):
         a = llm_client.make_client("some-model", timeout=30.0)
@@ -154,15 +183,11 @@ class TestClientCache(unittest.TestCase):
 
 class TestCustomEndpointRoute(unittest.TestCase):
     def setUp(self):
-        llm_client._CLIENT_CACHE.clear()
-        self._saved = {k: os.environ.pop(k, None)
-                       for k in ("GOEDEL_BASE_URL", "GOEDEL_API_KEY")}
+        self._env = _HermeticGodelEnv()
+        self._env.__enter__()
 
     def tearDown(self):
-        llm_client._CLIENT_CACHE.clear()
-        for k, v in self._saved.items():
-            if v is not None:
-                os.environ[k] = v
+        self._env.__exit__(None, None, None)
 
     def test_custom_base_url_routes_everything(self):
         os.environ["GOEDEL_BASE_URL"] = "https://api.deepseek.com/v1"
