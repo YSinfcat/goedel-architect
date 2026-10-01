@@ -51,9 +51,20 @@ class MathlibRetrieval:
 
     def __init__(self, timeout: float = DEFAULT_TIMEOUT):
         self._client = httpx.Client(timeout=timeout)
+        # Set by search() when the most recent call hit a backend failure;
+        # empty string means the last search completed (possibly with zero
+        # hits). See search().
+        self.last_error = ""
 
     def search(self, query: str, k: int = 10) -> list[LemmaResult]:
-        """Search Mathlib. Tries LeanSearch first, falls back to Loogle."""
+        """Search Mathlib. Tries LeanSearch first, falls back to Loogle.
+
+        An outage no longer masquerades as "no relevant lemmas": when BOTH
+        backends fail, the returned list is empty AND `self.last_error`
+        carries the failure so callers (and the prover's tool result text)
+        can tell "service down" from a genuine zero-hit query.
+        """
+        self.last_error = ""
         results = self._leansearch(query, k)
         if not results:
             results = self._loogle(query, k)
@@ -71,7 +82,8 @@ class MathlibRetrieval:
             )
             resp.raise_for_status()
             return self._parse_leansearch(resp.json())
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"LeanSearch unavailable: {exc}"
             return []
 
     def _loogle(self, query: str, k: int) -> list[LemmaResult]:
@@ -92,7 +104,8 @@ class MathlibRetrieval:
                     docstring=hit.get("doc") or "",
                 ))
             return results
-        except Exception:
+        except Exception as exc:
+            self.last_error = (self.last_error + "; " if self.last_error else "") + f"Loogle unavailable: {exc}"
             return []
 
     def _parse_leansearch(self, data: object) -> list[LemmaResult]:

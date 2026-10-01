@@ -99,12 +99,27 @@ def _invalidate_stale_proofs(
     return pruned
 
 
+def _provable_nodes(blueprint: Blueprint) -> set[str]:
+    """Nodes that still need an LLM proving attempt: everything except
+    definition-kind nodes, which carry real Lean bodies and were verified
+    by the blueprint's own compilation (the orchestrator seeds them as
+    solved for bookkeeping)."""
+    return {n.name for n in blueprint.nodes if n.kind != "definition"}
+
+
 def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_name: str) -> str:
-    return "\n\n".join(
-        f"{node.signature()} {format_proof_assign(proved_cache[node.name])}"
-        for node in blueprint.dependency_order()
-        if node.name != root_name and node.name in proved_cache
-    )
+    # Definitions emit their full declaration (real body/fields); theorems
+    # re-declare signature + single-assignment proof. Both orders respect
+    # the dependency order so Lean never sees a forward reference.
+    parts: list[str] = []
+    for node in blueprint.dependency_order():
+        if node.name == root_name:
+            continue
+        if node.kind == "definition":
+            parts.append(node.compiled_decl())
+        elif node.name in proved_cache:
+            parts.append(f"{node.signature()} {format_proof_assign(proved_cache[node.name])}")
+    return "\n\n".join(parts)
 
 
 def _gate_blueprint(blueprint: Blueprint, allow_unvalidated: bool, had_compiler: bool) -> None:
@@ -403,7 +418,7 @@ def prove_theorem(
 
     for iteration in range(start_iteration, max_iterations):
         # Phase 2: Parallel proving
-        nodes_to_try = set(blueprint.nodes_by_name()) - set(proved_cache)
+        nodes_to_try = _provable_nodes(blueprint) - set(proved_cache)
         print(f"\n[Phase 2 iteration {iteration+1}] Proving {len(nodes_to_try)} nodes: {sorted(nodes_to_try)}", flush=True)
 
         orch_result = asyncio.run(
@@ -429,7 +444,9 @@ def prove_theorem(
             status = nr.result.signal.value
             proof_preview = repr(nr.result.proof_body[:60]) if nr.result.proof_body else ""
             print(f"  node '{name}': {status} {proof_preview}", flush=True)
-            if status == "solved":
+            if status == "solved" and nr.result.proof_body:
+                # (definition-kind nodes are seeded SOLVED with an empty
+                # body - they live in the blueprint file, not the cache)
                 proved_cache[name] = normalize_proof_body(nr.result.proof_body)
                 node = blueprint.node_by_name(name)
                 if node:
@@ -674,7 +691,7 @@ def run_phase2(
     retrieval = retrieval or MathlibRetrieval()
     proved_cache = {name: normalize_proof_body(body) for name, body in state.proved_cache.items()}
     proof_cache_keys = dict(state.proof_cache_keys)
-    nodes_to_try = set(blueprint.nodes_by_name()) - set(proved_cache)
+    nodes_to_try = _provable_nodes(blueprint) - set(proved_cache)
 
     orch_result = asyncio.run(
         prove_dag(
@@ -695,7 +712,7 @@ def run_phase2(
     )
 
     for name, nr in orch_result.node_results.items():
-        if nr.result.signal.value == "solved":
+        if nr.result.signal.value == "solved" and nr.result.proof_body:
             proved_cache[name] = normalize_proof_body(nr.result.proof_body)
             node = blueprint.node_by_name(name)
             if node:

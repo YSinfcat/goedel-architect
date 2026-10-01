@@ -14,7 +14,7 @@ from typing import Callable
 import networkx as nx
 
 from blueprint import Blueprint, BlueprintNode
-from lean_compiler import AbstractLeanCompiler, normalize_proof_body
+from lean_compiler import AbstractLeanCompiler, format_proof_assign, normalize_proof_body
 from mathlib_retrieval import MathlibRetrieval
 from prover import ProofSignal, ProverResult, prove_node
 from tracer import NullTracer
@@ -137,11 +137,34 @@ async def prove_dag(
                 result=ProverResult(signal=ProofSignal.SOLVED, proof_body=body),
             )
 
+    # Definition-kind nodes (def/abbrev/structure/instance, with real Lean
+    # bodies) were already verified by the blueprint's own compilation in
+    # Phase 1/3 - sending them to the LLM prover burned a full proving
+    # budget asking the model to "prove" a definition. Seed them as solved
+    # so they count toward all_proved() and carry into aux declarations.
+    for node in blueprint.nodes:
+        if node.kind == "definition" and node.name not in orch_result.node_results:
+            orch_result.node_results[node.name] = NodeResult(
+                node=node,
+                result=ProverResult(
+                    signal=ProofSignal.SOLVED,
+                    proof_body="",
+                    analysis="definition with a real body - available once the "
+                             "blueprint compiles; not routed to the prover",
+                ),
+            )
+
     for generation in nx.topological_generations(dag):
         candidates = [
             name for name in generation
             if name not in proof_bodies
             and (nodes_to_retry is None or name in nodes_to_retry)
+            # Defense in depth: definition-kind nodes are seeded SOLVED and
+            # never need an attempt, even when a caller (e.g. a test or a
+            # direct prove_dag invocation) passes nodes_to_retry=None -
+            # pipeline excludes them, but prove_dag must hold on its own.
+            and (node := blueprint.node_by_name(name)) is not None
+            and node.kind != "definition"
         ]
         if not candidates:
             continue
@@ -247,11 +270,20 @@ async def _prove_one(
     # Proven dependencies are otherwise only shown to the model as prompt
     # text - re-declare them as real lemmas so `exact evalFuel_ret_sound h`
     # style references to already-solved siblings actually resolve instead of
-    # hitting "unknown identifier".
-    parent_lemma_decls = "\n\n".join(
-        f"{dep_node.signature()} {body}"
+    # hitting "unknown identifier". Definition-kind ancestors emit their full
+    # declaration (body/fields included) - they have no proof body to splice.
+    definition_decls = "\n\n".join(
+        n.compiled_decl()
+        for n in blueprint.dependency_order()
+        if n.kind == "definition" and n.name in ancestor_deps
+    )
+    proved_lemma_decls = "\n\n".join(
+        f"{dep_node.signature()} {format_proof_assign(body)}"
         for dep, body in parent_proofs.items()
         if (dep_node := blueprint.node_by_name(dep)) is not None
+    )
+    parent_lemma_decls = "\n\n".join(
+        part for part in (definition_decls, proved_lemma_decls) if part
     )
 
     async def attempt(

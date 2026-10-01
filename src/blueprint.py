@@ -252,6 +252,14 @@ class BlueprintNode:
         """
         return self.signature() + "\x00deps:" + ",".join(sorted(self.dependencies))
 
+    def compiled_decl(self) -> str:
+        """The full declaration, usable standalone: attribute stripped,
+        `lemma` normalized to `theorem`, real body (definitions carry their
+        actual Lean body / structure fields) intact. Definition-kind nodes
+        are available the moment the blueprint compiles - they never go
+        through the LLM prover (see orchestrator's definition seeding)."""
+        return lemma_to_theorem(strip_blueprint_attr(self.lean_declaration)).strip()
+
 
 @dataclass
 class Blueprint:
@@ -539,9 +547,13 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
     Extracts node names, kinds, statements, proof sketches, and sorry_using deps.
     """
     nodes: list[BlueprintNode] = []
-    # Match @[blueprint ...] blocks followed by a declaration
+    # Match @[blueprint ...] blocks followed by a declaration. Alternation
+    # order matters: `noncomputable def` before `def` so it isn't partially
+    # consumed; `structure`/`instance` were previously missing entirely -
+    # the prompt allowed emitting them but the parser silently dropped
+    # those nodes, leaving dangling sorry_using references.
     pattern = re.compile(
-        r'@\[blueprint\s*(.*?)\]\s*\n\s*(def|lemma|theorem|noncomputable def|abbrev)\s+(\w+)(.*?)(?=@\[blueprint|\Z)',
+        r'@\[blueprint\s*(.*?)\]\s*\n\s*(noncomputable def|structure|instance|def|lemma|theorem|abbrev)\s+(\w+)(.*?)(?=@\[blueprint|\Z)',
         re.DOTALL,
     )
     for m in pattern.finditer(lean_code):
@@ -550,7 +562,7 @@ def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
         name = m.group(3)
         rest = m.group(4)
 
-        kind = "definition" if kind_kw in ("def", "noncomputable def", "abbrev") else kind_kw
+        kind = "definition" if kind_kw in ("def", "noncomputable def", "abbrev", "structure", "instance") else kind_kw
 
         statement = _extract_attr(attrs_block, "statement")
         proof_sketch = _extract_attr(attrs_block, "proof")

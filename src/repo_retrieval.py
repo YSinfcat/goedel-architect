@@ -144,18 +144,26 @@ class RepoRetrieval:
         if not self._decls:
             return
 
-        # Check cache
-        cache_key = self._cache_key()
+        # Check cache. The key embeds the embedding model and a content
+        # fingerprint over every extracted declaration - previously the key
+        # was just the repo path and the staleness check compared
+        # declaration COUNT only, so edits that kept the count (a renamed
+        # lemma, a changed signature) silently reused stale embeddings.
+        cache_key = self._cache_key(self._decls)
         emb_path  = self.cache_dir / f"{cache_key}.npy"
         meta_path = self.cache_dir / f"{cache_key}.json"
 
         if emb_path.exists() and meta_path.exists():
             meta = json.loads(meta_path.read_text())
-            if meta.get("n") == len(self._decls):
+            content_hash = self._content_hash(self._decls)
+            if (meta.get("n") == len(self._decls)
+                    and meta.get("content_hash") == content_hash
+                    and meta.get("embed_model") == EMBED_MODEL):
                 self._embeddings = np.load(str(emb_path))
                 return
             print(f"[repo_retrieval] Cache for {self.repo_root.name} is stale "
-                  f"(cached n={meta.get('n')}, live n={len(self._decls)}) - rebuilding.")
+                  f"(cached n={meta.get('n')}, live n={len(self._decls)}; "
+                  f"content/embedding-model changed) - rebuilding.")
 
         # Build index
         print(f"[repo_retrieval] Building embedding index for {self.repo_root.name} "
@@ -166,12 +174,27 @@ class RepoRetrieval:
         # Save cache
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         np.save(str(emb_path), self._embeddings)
-        meta_path.write_text(json.dumps({"repo": str(self.repo_root), "n": len(self._decls)}))
+        meta_path.write_text(json.dumps({
+            "repo": str(self.repo_root),
+            "n": len(self._decls),
+            "embed_model": EMBED_MODEL,
+            "content_hash": self._content_hash(self._decls),
+        }))
         print(f"[repo_retrieval] Index saved to {emb_path}")
 
-    def _cache_key(self) -> str:
+    @staticmethod
+    def _content_hash(decls: list[RepoDecl]) -> str:
+        """sha256 over every declaration's identity and signature text, so
+        any content change (rename, signature edit, reorder) invalidates the
+        cache even when the declaration count is unchanged."""
+        h = hashlib.sha256()
+        for d in decls:
+            h.update(d.embed_text().encode("utf-8"))
+        return h.hexdigest()[:16]
+
+    def _cache_key(self, decls: list[RepoDecl]) -> str:
         h = hashlib.md5(str(self.repo_root.resolve()).encode()).hexdigest()[:12]
-        return f"{self.repo_root.name}_{h}"
+        return f"{self.repo_root.name}_{h}_{EMBED_MODEL.replace('/', '-')}_{self._content_hash(decls)}"
 
     # ---- embedding -------------------------------------------------------
 

@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from lean_compiler import AbstractLeanCompiler, CompilerResult
@@ -40,6 +42,14 @@ def _chat_reasoning_kwargs(model: str) -> dict:
     return {}
 
 try:
+    # Pin this module's own directory ahead of whatever sys.path the entry
+    # point built: a drifted duplicate `repo_retrieval.py` lives in eval/
+    # (legacy copy, see review P1-8), and when eval/ precedes src/ on
+    # sys.path this short-name import silently binds to THAT copy instead
+    # of the canonical one - the two have already diverged.
+    _HERE = str(Path(__file__).resolve().parent)
+    if sys.path[0] != _HERE:
+        sys.path.insert(0, _HERE)
     from repo_retrieval import RepoRetrieval
     _HAS_REPO_RETRIEVAL = True
 except ImportError:
@@ -544,6 +554,13 @@ class GoedelProver:
             elif fn == "mathlib_search":
                 hits = self.retrieval.search(args["query"], args.get("k", 10))
                 result = "\n\n".join(h.format() for h in hits) or "No results found."
+                if not hits and getattr(self.retrieval, "last_error", ""):
+                    # Service outage, not a genuine zero-hit query - say so,
+                    # otherwise the model concludes no lemma exists and
+                    # hand-rolls one.
+                    result = (f"Search backends unavailable ({self.retrieval.last_error}). "
+                              "This is NOT a zero-result answer - retry later or prove "
+                              "without library search.")
 
             else:
                 result = f"Tool unavailable: {fn}"

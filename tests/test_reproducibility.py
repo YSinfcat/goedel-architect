@@ -24,8 +24,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT / "src"))
+# eval/ only provides metrics/graph_viz (no name clashes with src/); keep
+# src/ ahead so any shared short name binds to the canonical module.
 sys.path.insert(0, str(ROOT / "eval"))
+sys.path.insert(0, str(ROOT / "src"))
 
 # Keep fingerprints hermetic and fast: no lake probing in tests.
 os.environ.setdefault("GOEDEL_LEAN_TOOLCHAIN", "test-toolchain")
