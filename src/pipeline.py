@@ -478,6 +478,7 @@ def prove_theorem(
             tracer.emit(TraceEvent(
                 kind="final_verify", thm_name=thm_name or root_name,
                 ok=verification.passed,
+                iteration=iteration + 1,
                 args={"mode": verification.mode, "errors": verification.errors[:5]},
             ))
             if not verification.passed:

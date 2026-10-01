@@ -13,7 +13,7 @@ from pathlib import Path
 from openai import OpenAI
 
 from lean_compiler import AbstractLeanCompiler, LeanCompiler, CompilerResult
-from llm_client import make_client
+from llm_client import create_with_retry, make_client
 from goedel_prompts import load, render
 from tracer import TraceEvent
 
@@ -161,7 +161,7 @@ def _call_with_repo_search(
         # no-tools finalization call below (and to every call when
         # repo_retrieval is None, unchanged from before this tool existed).
         call_kwargs = {"tools": tools} if tools else dict(reasoning_kwargs)
-        response = client.chat.completions.create(
+        response = create_with_retry(client,
             model=model,
             messages=messages,
             max_completion_tokens=max_tokens,
@@ -194,7 +194,7 @@ def _call_with_repo_search(
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
     # Exhausted search turns without a final text response - one last call
     # with tools withheld forces the model to commit to an answer.
-    response = client.chat.completions.create(
+    response = create_with_retry(client,
         model=model, messages=messages, max_completion_tokens=max_tokens, **reasoning_kwargs,
     )
     _emit_usage(tracer, thm_name, phase, model, response)

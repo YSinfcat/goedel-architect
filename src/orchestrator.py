@@ -288,9 +288,18 @@ async def _prove_one(
 
     async def attempt(
         use_model: str, timeout_s: float | None, max_tool_calls: int | None = None,
+        fresh_compiler: bool = False,
     ) -> tuple[ProverResult, float]:
         t0 = time.monotonic()
         loop = asyncio.get_event_loop()
+        # A timed-out cascade attempt keeps running in its worker thread
+        # (asyncio.wait_for cannot kill it) and may still be issuing calls
+        # on `active_compiler` - stateful backends (VSBLeanCompiler tracks
+        # call counts and writes temp files) must not be shared with the
+        # escalation attempt running beside it. When a factory exists, give
+        # the escalation its own instance.
+        attempt_compiler = (compiler_factory() if fresh_compiler and compiler_factory
+                            else active_compiler)
         future = loop.run_in_executor(
             None,
             functools.partial(
@@ -299,7 +308,7 @@ async def _prove_one(
                 canonical_stmt=node.lean_declaration,
                 parent_proofs=parent_proofs,
                 parent_lemma_decls=parent_lemma_decls,
-                compiler=active_compiler,
+                compiler=attempt_compiler,
                 retrieval=retrieval,
                 model=use_model,
                 node_statement_nl=node.statement,
@@ -364,10 +373,14 @@ async def _prove_one(
 
     # escalation_max_tool_calls only applies when this is a genuine escalation
     # after a failed cascade attempt - a direct (non-cascaded) call to `model`
-    # keeps its full default budget, unchanged from prior behavior.
+    # keeps its full default budget, unchanged from prior behavior. The
+    # escalation also gets a fresh compiler instance when a factory exists
+    # (see `attempt`): the timed-out cheap attempt's thread may still be
+    # using the shared one.
     result, dt = await attempt(
         model, node_timeout_s,
         max_tool_calls=escalation_max_tool_calls if escalating else None,
+        fresh_compiler=escalating,
     )
     print(f"    [node {name}] finished after {dt:.1f}s -> {result.signal.value}", flush=True)
     return NodeResult(node=node, result=result)

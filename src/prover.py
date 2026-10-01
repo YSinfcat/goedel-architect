@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from lean_compiler import AbstractLeanCompiler, CompilerResult
-from llm_client import make_client
+from llm_client import create_with_retry, make_client
 from mathlib_retrieval import MathlibRetrieval
 from goedel_prompts import load, render
 from tracer import NullTracer, TraceEvent
@@ -350,7 +350,7 @@ class GoedelProver:
         ]
 
         # Force first call to lean_compile
-        response = self.client.chat.completions.create(
+        response = create_with_retry(self.client,
             model=self.model_id,
             messages=messages,
             tools=TOOLS,
@@ -393,7 +393,7 @@ class GoedelProver:
                 if (had_search and not had_compile) else "required"
             )
 
-            response = self.client.chat.completions.create(
+            response = create_with_retry(self.client,
                 model=self.model_id,
                 messages=messages,
                 tools=TOOLS,
@@ -405,7 +405,7 @@ class GoedelProver:
         # Drain any pending tool calls (get the model's reaction to the last
         # round of tool results without letting it call more tools)
         if had_tool_calls:
-            response = self.client.chat.completions.create(
+            response = create_with_retry(self.client,
                 model=self.model_id,
                 messages=messages,
                 tools=TOOLS,
@@ -428,7 +428,7 @@ class GoedelProver:
                 "role": "user",
                 "content": "Output your best proof: <lean4_proof>:= by\n  ...\n</lean4_proof>",
             })
-            response = self.client.chat.completions.create(
+            response = create_with_retry(self.client,
                 model=self.model_id,
                 messages=messages,
                 max_completion_tokens=MAX_TOKENS,
@@ -601,7 +601,7 @@ class GoedelProver:
             "Call lean_compile. If it succeeds, the original statement is formally refuted."
         )
         messages.append({"role": "user", "content": prompt})
-        response = self.client.chat.completions.create(
+        response = create_with_retry(self.client,
             model=self.model_id,
             messages=messages,
             tools=TOOLS,
@@ -648,7 +648,7 @@ class GoedelProver:
                     output = "Tool unavailable in negation probe."
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
 
-            response = self.client.chat.completions.create(
+            response = create_with_retry(self.client,
                 model=self.model_id,
                 messages=messages,
                 tools=TOOLS,

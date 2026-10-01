@@ -24,6 +24,11 @@ class TraceEvent:
     args: dict[str, Any] | None = None
     result: str | None = None
     ok: bool | None = None
+    # Refinement round the event belongs to (1-based; None for events
+    # outside the phase loop). Previously every iteration's events were
+    # indistinguishable in a trace, so cross-round token aggregation and
+    # visualization mixed rounds together (review IV.6).
+    iteration: int | None = None
     ts: float = field(default_factory=time.time)
 
 
