@@ -10,6 +10,7 @@ The `compiler` parameter is injectable so the same pipeline works with:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,6 +98,15 @@ def _invalidate_stale_proofs(
         if new_node is None or proof_cache_keys.get(name) != new_node.cache_key():
             del pruned[name]
     return pruned
+
+
+def _structure_fingerprint(blueprint: Blueprint) -> str:
+    """sha256 over the sorted (name, cache_key) pairs - the graph's shape
+    (node names + signatures + dependency sets), independent of the proofs
+    currently cached against it. Two refinements that produce the same
+    shape fingerprint would run Phase 2 on identical work."""
+    parts = sorted(f"{n.name}\x00{n.cache_key()}" for n in blueprint.nodes)
+    return hashlib.sha256("\x01".join(parts).encode()).hexdigest()
 
 
 def _provable_nodes(blueprint: Blueprint) -> set[str]:
@@ -233,7 +243,7 @@ def _final_verification(
                               errors=["no compiler available for final verification"])
 
 
-def prove_theorem(
+async def prove_theorem_async(
     theorem_stmt: str,
     nl_proof: str | None = None,
     model: str = "labs-leanstral-1-5",
@@ -415,14 +425,21 @@ def prove_theorem(
 
     orch_result: OrchestratorResult | None = None
     last_verification: VerificationReport | None = None
+    # structure fingerprint -> solved count at the moment that exact graph
+    # shape was worked on. Used by the no-progress stop (review III.2):
+    # refinement that oscillates (split, merge, re-split the same nodes)
+    # burns a full Phase-2 proving budget per round for nothing.
+    seen_structures: dict[str, int] = {
+        _structure_fingerprint(blueprint): len(proved_cache)
+    }
+    stagnation_rounds = 0
 
     for iteration in range(start_iteration, max_iterations):
         # Phase 2: Parallel proving
         nodes_to_try = _provable_nodes(blueprint) - set(proved_cache)
         print(f"\n[Phase 2 iteration {iteration+1}] Proving {len(nodes_to_try)} nodes: {sorted(nodes_to_try)}", flush=True)
 
-        orch_result = asyncio.run(
-            prove_dag(
+        orch_result = await prove_dag(
                 blueprint=blueprint,
                 compiler=compiler,
                 compiler_factory=compiler_factory,
@@ -438,7 +455,6 @@ def prove_theorem(
                 escalation_max_tool_calls=escalation_max_tool_calls,
                 enable_negation_probe=enable_negation_probe,
             )
-        )
 
         for name, nr in orch_result.node_results.items():
             status = nr.result.signal.value
@@ -574,6 +590,34 @@ def prove_theorem(
         proved_cache = _invalidate_stale_proofs(blueprint, proved_cache, proof_cache_keys)
         proof_cache_keys = {name: key for name, key in proof_cache_keys.items() if name in proved_cache}
 
+        # No-progress stop (review III.2): refinement sometimes oscillates -
+        # split a node, merge it back, re-split it - and each round re-buys a
+        # full Phase-2 proving budget for a graph that is structurally the
+        # one already attempted. Stop when the NEW graph shape has been seen
+        # before AND it solved no more nodes back then than we have now
+        # (i.e. two consecutive rounds without a solved-count increase and a
+        # repeated structure fingerprint).
+        new_fp = _structure_fingerprint(blueprint)
+        if len(proved_cache) <= seen_structures.get(new_fp, -1):
+            stagnation_rounds += 1
+        else:
+            stagnation_rounds = 0
+        if new_fp in seen_structures and stagnation_rounds >= 2:
+            print(f"  [no-progress] refined graph repeats an earlier structure "
+                  f"(solved {len(proved_cache)} unchanged for {stagnation_rounds} "
+                  f"refinement rounds) - stopping early instead of re-proving it",
+                  flush=True)
+            if checkpoint_path:
+                state.set_blueprint(blueprint)
+                state.refinement_history = list(refinement_history)
+                state.iteration = iteration + 1
+                state.proved_cache = dict(proved_cache)
+                state.proof_cache_keys = dict(proof_cache_keys)
+                state.node_results = {}
+                state.save(checkpoint_path)
+            break
+        seen_structures[new_fp] = len(proved_cache)
+
         if checkpoint_path:
             state.set_blueprint(blueprint)
             state.refinement_history = list(refinement_history)
@@ -596,11 +640,65 @@ def prove_theorem(
         proof_body=root_proof,
         final_lean_file=_assemble_partial_file(blueprint, orch_result, proved_cache),
         aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, blueprint.target_theorem),
-        iterations=max_iterations,
+        # actual rounds run, not the cap: refinement failure and the
+        # no-progress stop both end the loop before max_iterations
+        iterations=(iteration + 1) if orch_result is not None else 0,
         proved_nodes=proved,
         failed_nodes=failed,
         final_verification=last_verification,
     )
+
+
+def prove_theorem(
+    theorem_stmt: str,
+    nl_proof: str | None = None,
+    model: str = "labs-leanstral-1-5",
+    compiler: AbstractLeanCompiler | None = None,
+    compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
+    retrieval: MathlibRetrieval | None = None,
+    repo_retrieval=None,
+    max_iterations: int = MAX_REFINEMENT_ITERATIONS,
+    tracer=None,
+    project_root: Path | None = None,
+    repo_context: str | None = None,
+    node_timeout_s: float | None = 300.0,
+    checkpoint_path: Path | None = None,
+    thm_name: str = "",
+    cascade_model: str | None = None,
+    cascade_timeout_s: float | None = None,
+    escalation_max_tool_calls: int | None = 1,
+    allow_unvalidated_blueprint: bool = False,
+    enable_negation_probe: bool = False,
+    retry_failed: bool = False,
+) -> ProofResult:
+    """Synchronous wrapper around prove_theorem_async (review IV.5): the
+    library no longer calls asyncio.run() deep inside a sync API, which
+    blew up under Jupyter/FastAPI/any already-running event loop. Use the
+    async variant natively inside one; this wrapper starts a fresh loop
+    exactly like the old behavior.
+    """
+    return asyncio.run(prove_theorem_async(
+        theorem_stmt=theorem_stmt,
+        nl_proof=nl_proof,
+        model=model,
+        compiler=compiler,
+        compiler_factory=compiler_factory,
+        retrieval=retrieval,
+        repo_retrieval=repo_retrieval,
+        max_iterations=max_iterations,
+        tracer=tracer,
+        project_root=project_root,
+        repo_context=repo_context,
+        node_timeout_s=node_timeout_s,
+        checkpoint_path=checkpoint_path,
+        thm_name=thm_name,
+        cascade_model=cascade_model,
+        cascade_timeout_s=cascade_timeout_s,
+        escalation_max_tool_calls=escalation_max_tool_calls,
+        allow_unvalidated_blueprint=allow_unvalidated_blueprint,
+        enable_negation_probe=enable_negation_probe,
+        retry_failed=retry_failed,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +753,7 @@ def run_phase1(
     return blueprint
 
 
-def run_phase2(
+async def run_phase2_async(
     checkpoint_path: Path,
     compiler: AbstractLeanCompiler | None = None,
     compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
@@ -694,8 +792,7 @@ def run_phase2(
     proof_cache_keys = dict(state.proof_cache_keys)
     nodes_to_try = _provable_nodes(blueprint) - set(proved_cache)
 
-    orch_result = asyncio.run(
-        prove_dag(
+    orch_result = await prove_dag(
             blueprint=blueprint,
             compiler=compiler,
             compiler_factory=compiler_factory,
@@ -710,7 +807,6 @@ def run_phase2(
             cascade_timeout_s=cascade_timeout_s,
             escalation_max_tool_calls=escalation_max_tool_calls,
         )
-    )
 
     for name, nr in orch_result.node_results.items():
         if nr.result.signal.value == "solved" and nr.result.proof_body:
@@ -740,6 +836,35 @@ def run_phase2(
         state.success = False
     state.save(checkpoint_path)
     return orch_result
+
+
+def run_phase2(
+    checkpoint_path: Path,
+    compiler: AbstractLeanCompiler | None = None,
+    compiler_factory: Callable[[], AbstractLeanCompiler] | None = None,
+    retrieval: MathlibRetrieval | None = None,
+    repo_retrieval=None,
+    tracer=None,
+    node_timeout_s: float | None = 300.0,
+    model: str | None = None,
+    cascade_model: str | None = None,
+    cascade_timeout_s: float | None = None,
+    escalation_max_tool_calls: int | None = 1,
+) -> OrchestratorResult:
+    """Synchronous wrapper around run_phase2_async (see prove_theorem)."""
+    return asyncio.run(run_phase2_async(
+        checkpoint_path=checkpoint_path,
+        compiler=compiler,
+        compiler_factory=compiler_factory,
+        retrieval=retrieval,
+        repo_retrieval=repo_retrieval,
+        tracer=tracer,
+        node_timeout_s=node_timeout_s,
+        model=model,
+        cascade_model=cascade_model,
+        cascade_timeout_s=cascade_timeout_s,
+        escalation_max_tool_calls=escalation_max_tool_calls,
+    ))
 
 
 def run_phase3(
