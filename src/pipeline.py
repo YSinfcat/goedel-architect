@@ -15,16 +15,37 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from blueprint import Blueprint, generate_blueprint
+from blueprint import Blueprint, BlueprintValidationError, generate_blueprint, validate_blueprint
 from checkpoint import CheckpointState
-from lean_compiler import AbstractLeanCompiler, LeanCompiler
+from lean_compiler import (
+    AbstractLeanCompiler,
+    LeanCompiler,
+    MATHLIB_HEADER,
+    format_proof_assign,
+    normalize_proof_body,
+)
 from mathlib_retrieval import MathlibRetrieval
 from orchestrator import NodeResult, OrchestratorResult, prove_dag
+from prover import ProofSignal, ProverResult
 from refinement import refine_blueprint
-from tracer import NullTracer
+from tracer import NullTracer, TraceEvent
 
 # From Appendix A
 MAX_REFINEMENT_ITERATIONS = 8
+
+
+@dataclass
+class VerificationReport:
+    """Outcome of the independent final verification against the ORIGINAL
+    theorem statement (the immutable `theorem_stmt` input, never the refined
+    blueprint's root). A pipeline result may claim success=True only when
+    `passed` is True - everything else (all nodes reporting solved, a
+    weakened-but-provable root signature, an assembled final file) is
+    subordinate to this check."""
+    performed: bool
+    passed: bool = False
+    mode: str = ""       # "full-file" | "vsb-root-recheck" | "unavailable"
+    errors: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -42,6 +63,7 @@ class ProofResult:
     iterations: int = 0
     proved_nodes: list[str] = field(default_factory=list)
     failed_nodes: list[str] = field(default_factory=list)
+    final_verification: VerificationReport | None = None
 
 
 def _invalidate_stale_proofs(
@@ -78,10 +100,121 @@ def _invalidate_stale_proofs(
 
 def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_name: str) -> str:
     return "\n\n".join(
-        f"{node.signature()} {proved_cache[node.name]}"
+        f"{node.signature()} {format_proof_assign(proved_cache[node.name])}"
         for node in blueprint.dependency_order()
         if node.name != root_name and node.name in proved_cache
     )
+
+
+def _gate_blueprint(blueprint: Blueprint, allow_unvalidated: bool, had_compiler: bool) -> None:
+    """Hard gate between Phase 1/3 and Phase 2.
+
+    Two layers:
+      - structural validation (duplicate names, unknown dependencies,
+        cycles, dead nodes, missing target) ALWAYS applies - it is pure
+        Python and correctness-critical, with no legitimate debug escape;
+      - compile validation (blueprint.fully_validated) applies whenever a
+        blueprint compiler existed to validate it. Escapable only via the
+        explicit allow_unvalidated flag (a debugging mode); the pipeline's
+        final verification still has to pass before any success is
+        reported, so the escape can never manufacture a fake success.
+
+    `had_compiler` distinguishes "failed validation" (compiler present,
+    fully_validated=False) from "validation was impossible" (the
+    compiler_factory-only VSB path, where blueprint compilation happens
+    per-node inside the repo environment instead).
+    """
+    errors = validate_blueprint(blueprint)
+    if errors:
+        raise BlueprintValidationError(
+            "Blueprint failed structural validation:\n  - " + "\n  - ".join(errors)
+        )
+    if had_compiler and not blueprint.fully_validated and not allow_unvalidated:
+        raise BlueprintValidationError(
+            "Blueprint was never accepted by a real Lean compile "
+            "(fully_validated=False) - refusing to enter Phase 2. Pass "
+            "allow_unvalidated_blueprint=True (debugging only; success still "
+            "requires independent final verification) to override."
+        )
+
+
+_SORRY_TAIL_RE = re.compile(r":=\s*(?:by\s+)?sorry\s*\Z", re.DOTALL)
+
+
+def _assemble_original_theorem_file(
+    theorem_stmt: str, aux_lemma_decls: str, root_proof: str,
+) -> str:
+    """Assemble the independent final-verification file from the IMMUTABLE
+    original theorem statement - never the refined blueprint's root node.
+
+    The root proof (canonical `by ...` form) is spliced into the original
+    statement's `sorry` tail, with every proved auxiliary node re-declared
+    ahead of it. If the blueprint weakened the root's signature, the root
+    proof will not typecheck against the ORIGINAL statement here and the
+    compile fails - exactly the false-success mode this file exists to
+    catch. Fails closed: a statement with no recognizable `sorry` tail and
+    no `:=` at all gets the proof appended; a statement that already has a
+    non-sorry body is left as-is (its compile will fail rather than
+    silently re-proving something else).
+    """
+    proof = format_proof_assign(root_proof)
+    stmt = theorem_stmt.strip()
+    if _SORRY_TAIL_RE.search(stmt):
+        stmt = _SORRY_TAIL_RE.sub(lambda _: proof, stmt, count=1)
+    elif ":=" not in stmt:
+        stmt = f"{stmt} {proof}"
+    parts = [MATHLIB_HEADER.rstrip("\n")]
+    if aux_lemma_decls.strip():
+        parts.append(aux_lemma_decls.strip())
+    parts.append(stmt)
+    return "\n\n".join(parts) + "\n"
+
+
+def _final_verification(
+    theorem_stmt: str,
+    blueprint: Blueprint,
+    proved_cache: dict[str, str],
+    compiler: AbstractLeanCompiler | None,
+    compiler_factory=None,
+) -> VerificationReport:
+    """Independently verify the ORIGINAL theorem with the assembled proofs.
+
+    Shared-compiler (standalone Lean) mode compiles the full file built by
+    _assemble_original_theorem_file. Factory-only (VSB) mode re-checks the
+    root proof against the ORIGINAL root statement by calling a fresh
+    factory compiler WITHOUT node_decl - VSBLeanCompiler.check falls back
+    to the entry's thm_stmt (the original proposition) exactly when
+    node_decl is absent, so this re-check closes the same hole for VSB
+    (belt to run_verisoftbench's own external verifyProof braces).
+    """
+    root_name = blueprint.target_theorem
+    root_proof = proved_cache.get(root_name, "")
+    if not root_proof.strip():
+        return VerificationReport(performed=False, mode="unavailable",
+                                  errors=["root node has no cached proof"])
+    aux = _aux_lemma_decls(blueprint, proved_cache, root_name)
+    if compiler is not None:
+        file = _assemble_original_theorem_file(theorem_stmt, aux, root_proof)
+        result = compiler.check(file)
+        return VerificationReport(
+            performed=True, passed=result.success, mode="full-file",
+            errors=result.errors,
+        )
+    if compiler_factory is not None:
+        try:
+            fresh = compiler_factory()
+        except Exception as exc:  # factory failure is infra, not a pass
+            return VerificationReport(performed=False, mode="unavailable",
+                                      errors=[f"compiler_factory raised {exc!r}"])
+        # ':= by ...' form - the VSB harness splices this after the bare
+        # original signature (format_generated_lean contract).
+        result = fresh.check(format_proof_assign(root_proof), aux_lemmas=aux)
+        return VerificationReport(
+            performed=True, passed=result.success, mode="vsb-root-recheck",
+            errors=result.errors,
+        )
+    return VerificationReport(performed=False, mode="unavailable",
+                              errors=["no compiler available for final verification"])
 
 
 def prove_theorem(
@@ -102,6 +235,8 @@ def prove_theorem(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
+    allow_unvalidated_blueprint: bool = False,
+    enable_negation_probe: bool = False,
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -157,18 +292,53 @@ def prove_theorem(
         # re-deriving an answer that's already on disk).
         print(f"[Resume] checkpoint at {checkpoint_path} already done "
               f"(success={state.success}) — returning cached result", flush=True)
-        return _proof_result_from_checkpoint(state)
+        cached = _proof_result_from_checkpoint(state, compiler=compiler, compiler_factory=compiler_factory)
+        if cached.success and (cached.final_verification is None or not cached.final_verification.passed):
+            # Checkpoints written before independent final verification
+            # existed (or by the allow_unvalidated escape) claim success
+            # without a verified original theorem. Re-verify now - it's one
+            # local compile - and downgrade to a failure if it doesn't hold.
+            verification = _final_verification(
+                theorem_stmt, state.get_blueprint() or Blueprint(nodes=[], lean_file="", target_theorem=""),
+                state.proved_cache, compiler, compiler_factory=compiler_factory,
+            )
+            if not verification.passed:
+                print(f"[Resume] cached success FAILED re-verification ({verification.mode}): "
+                      f"{verification.errors[:3]} — downgrading to failure", flush=True)
+                return ProofResult(
+                    success=False,
+                    theorem_name=cached.theorem_name,
+                    proof_body=cached.proof_body,
+                    final_lean_file=cached.final_lean_file,
+                    aux_lemma_decls=cached.aux_lemma_decls,
+                    iterations=cached.iterations,
+                    proved_nodes=cached.proved_nodes,
+                    failed_nodes=cached.failed_nodes,
+                    final_verification=verification,
+                )
+            cached.final_verification = verification
+        return cached
 
     resumed_blueprint = state.get_blueprint() if state else None
 
     if resumed_blueprint is not None:
         blueprint = resumed_blueprint
-        proved_cache: dict[str, str] = dict(state.proved_cache)
+        # Normalize cached bodies to the canonical `by ...` form - older
+        # checkpoints may predate the single-representation rule and hold
+        # `:= by ...` bodies that would double-assign on re-assembly.
+        proved_cache: dict[str, str] = {
+            name: normalize_proof_body(body) for name, body in state.proved_cache.items()
+        }
         proof_cache_keys: dict[str, str] = dict(state.proof_cache_keys)
         refinement_history: list[str] = list(state.refinement_history)
         start_iteration = state.iteration
         print(f"[Resume] loaded checkpoint at iteration {start_iteration + 1}, "
               f"{len(proved_cache)} node(s) already proved", flush=True)
+        # Same gate a fresh Phase 1 blueprint must pass: a resumed graph
+        # that is structurally broken (or was never compile-validated by a
+        # real Lean run) must not quietly continue into Phase 2.
+        _gate_blueprint(blueprint, allow_unvalidated=allow_unvalidated_blueprint,
+                        had_compiler=compiler is not None)
     else:
         # Phase 1: Blueprint generation
         # Don't use compiler_factory for blueprint validation: factory compilers are
@@ -190,12 +360,19 @@ def prove_theorem(
         proof_cache_keys = {}
         refinement_history = []
         start_iteration = 0
+        # Hard gate: a blueprint that failed (or was never given) a real
+        # compile must not enter Phase 2 - previously the give-up path after
+        # MAX_RETRIES returned fully_validated=False and the pipeline
+        # happily burned model calls proving nodes of an unvalidated graph.
+        _gate_blueprint(blueprint, allow_unvalidated=allow_unvalidated_blueprint,
+                        had_compiler=blueprint_compiler is not None)
         state = CheckpointState(theorem_stmt=theorem_stmt, model=model, repo_context=repo_context or "")
         state.set_blueprint(blueprint)
         if checkpoint_path:
             state.save(checkpoint_path)
 
     orch_result: OrchestratorResult | None = None
+    last_verification: VerificationReport | None = None
 
     for iteration in range(start_iteration, max_iterations):
         # Phase 2: Parallel proving
@@ -217,6 +394,7 @@ def prove_theorem(
                 cascade_model=cascade_model,
                 cascade_timeout_s=cascade_timeout_s,
                 escalation_max_tool_calls=escalation_max_tool_calls,
+                enable_negation_probe=enable_negation_probe,
             )
         )
 
@@ -225,7 +403,7 @@ def prove_theorem(
             proof_preview = repr(nr.result.proof_body[:60]) if nr.result.proof_body else ""
             print(f"  node '{name}': {status} {proof_preview}", flush=True)
             if status == "solved":
-                proved_cache[name] = nr.result.proof_body
+                proved_cache[name] = normalize_proof_body(nr.result.proof_body)
                 node = blueprint.node_by_name(name)
                 if node:
                     proof_cache_keys[name] = node.cache_key()
@@ -241,20 +419,59 @@ def prove_theorem(
         if orch_result.all_proved():
             root_name = blueprint.target_theorem
             root_proof = proved_cache.get(root_name, "")
-            if checkpoint_path:
-                state.done = True
-                state.success = True
-                state.save(checkpoint_path)
-            return ProofResult(
-                success=True,
-                theorem_name=root_name,
-                proof_body=root_proof,
-                final_lean_file=_assemble_final_file(blueprint, orch_result),
-                aux_lemma_decls=_aux_lemma_decls(blueprint, proved_cache, root_name),
-                iterations=iteration + 1,
-                proved_nodes=list(orch_result.proved),
-                failed_nodes=[],
+            aux_decls = _aux_lemma_decls(blueprint, proved_cache, root_name)
+            final_file = _assemble_final_file(blueprint, orch_result)
+            # THE success criterion: every node reporting solved proves
+            # nothing about the ORIGINAL theorem (a weakened-but-provable
+            # root signature would also get here). Independently re-verify
+            # the immutable theorem_stmt with the assembled proofs; only a
+            # pass here may set success - this is also what a resumed
+            # checkpoint's success is re-checked against.
+            verification = _final_verification(
+                theorem_stmt, blueprint, proved_cache, compiler,
+                compiler_factory=compiler_factory,
             )
+            tracer.emit(TraceEvent(
+                kind="final_verify", thm_name=thm_name or root_name,
+                ok=verification.passed,
+                args={"mode": verification.mode, "errors": verification.errors[:5]},
+            ))
+            if not verification.passed:
+                print(f"  [final verification] FAILED ({verification.mode}): "
+                      f"{verification.errors[:3]} - treating this iteration as "
+                      f"unsuccessful and continuing to refinement", flush=True)
+                last_verification = verification
+                # Mark the root node as needing rework so Phase 3 gets a
+                # real diagnostic instead of an all-PROVED graph it can
+                # only echo back unchanged.
+                orch_result.node_results[root_name] = NodeResult(
+                    node=blueprint.node_by_name(root_name),
+                    result=ProverResult(
+                        signal=ProofSignal.PROOF_TOO_HARD,
+                        analysis=(
+                            "Assembled proofs FAILED independent verification "
+                            f"against the ORIGINAL theorem statement ({verification.mode}): "
+                            + "; ".join(verification.errors[:3])
+                        ),
+                    ),
+                )
+            else:
+                print("  [final verification] passed against the original theorem statement", flush=True)
+                if checkpoint_path:
+                    state.done = True
+                    state.success = True
+                    state.save(checkpoint_path)
+                return ProofResult(
+                    success=True,
+                    theorem_name=root_name,
+                    proof_body=root_proof,
+                    final_lean_file=final_file,
+                    aux_lemma_decls=aux_decls,
+                    iterations=iteration + 1,
+                    proved_nodes=list(orch_result.proved),
+                    failed_nodes=[],
+                    final_verification=verification,
+                )
 
         if checkpoint_path:
             state.save(checkpoint_path)
@@ -284,6 +501,16 @@ def prove_theorem(
                 thm_name=thm_name,
             )
             print(f"  new blueprint has {len(blueprint.nodes)} nodes: {[n.name for n in blueprint.nodes]}", flush=True)
+            # A refined graph must still be structurally sound (the compile
+            # gate already ran inside refine_blueprint's check_blueprint;
+            # this catches shape regressions the Lean check can't see, like
+            # a dead node or a lost target).
+            structural_errors = validate_blueprint(blueprint)
+            if structural_errors:
+                raise BlueprintValidationError(
+                    "Refined blueprint failed structural validation:\n  - "
+                    + "\n  - ".join(structural_errors)
+                )
         except RuntimeError as e:
             print(f"  refinement failed: {e}", flush=True)
             # refine_blueprint mutates `history` in place before its own
@@ -327,6 +554,7 @@ def prove_theorem(
         iterations=max_iterations,
         proved_nodes=proved,
         failed_nodes=failed,
+        final_verification=last_verification,
     )
 
 
@@ -392,9 +620,18 @@ def run_phase2(
     blueprint = state.get_blueprint()
     if blueprint is None:
         raise RuntimeError(f"No blueprint in checkpoint {checkpoint_path} — run Phase 1 first.")
+    # Standalone Phase 2 entries get the same structural gate the all-in-one
+    # loop applies - a checkpointed graph that is structurally broken must
+    # not quietly continue into proving.
+    structural_errors = validate_blueprint(blueprint)
+    if structural_errors:
+        raise BlueprintValidationError(
+            f"Blueprint in {checkpoint_path} failed structural validation:\n  - "
+            + "\n  - ".join(structural_errors)
+        )
 
     retrieval = retrieval or MathlibRetrieval()
-    proved_cache = dict(state.proved_cache)
+    proved_cache = {name: normalize_proof_body(body) for name, body in state.proved_cache.items()}
     proof_cache_keys = dict(state.proof_cache_keys)
     nodes_to_try = set(blueprint.nodes_by_name()) - set(proved_cache)
 
@@ -418,7 +655,7 @@ def run_phase2(
 
     for name, nr in orch_result.node_results.items():
         if nr.result.signal.value == "solved":
-            proved_cache[name] = nr.result.proof_body
+            proved_cache[name] = normalize_proof_body(nr.result.proof_body)
             node = blueprint.node_by_name(name)
             if node:
                 proof_cache_keys[name] = node.cache_key()
@@ -426,8 +663,22 @@ def run_phase2(
     state.proved_cache = proved_cache
     state.proof_cache_keys = proof_cache_keys
     state.set_node_results(orch_result.node_results)
-    state.done = orch_result.all_proved()
-    state.success = state.done
+    if orch_result.all_proved():
+        # Same success criterion as the all-in-one loop: all nodes solved
+        # must still survive independent verification against the original
+        # theorem before the checkpoint may record success.
+        verification = _final_verification(
+            state.theorem_stmt, blueprint, proved_cache, compiler,
+            compiler_factory=compiler_factory,
+        )
+        state.done = True
+        state.success = verification.passed
+        if not verification.passed:
+            print(f"[Phase 2 standalone] final verification FAILED "
+                  f"({verification.mode}): {verification.errors[:3]}", flush=True)
+    else:
+        state.done = False
+        state.success = False
     state.save(checkpoint_path)
     return orch_result
 
@@ -509,9 +760,13 @@ def _orch_result_from_checkpoint(state: CheckpointState, blueprint: Blueprint) -
     })
 
 
-def _proof_result_from_checkpoint(state: CheckpointState) -> ProofResult:
+def _proof_result_from_checkpoint(
+    state: CheckpointState,
+    compiler: AbstractLeanCompiler | None = None,
+    compiler_factory=None,
+) -> ProofResult:
     blueprint = state.get_blueprint()
-    proved_cache = dict(state.proved_cache)
+    proved_cache = {name: normalize_proof_body(body) for name, body in state.proved_cache.items()}
     orch_result = _orch_result_from_checkpoint(state, blueprint)
     root_name = blueprint.target_theorem
     root_proof = proved_cache.get(root_name, "")
@@ -525,6 +780,9 @@ def _proof_result_from_checkpoint(state: CheckpointState) -> ProofResult:
             iterations=state.iteration + 1,
             proved_nodes=list(orch_result.proved),
             failed_nodes=[],
+            # final_verification is left None here on purpose: the caller
+            # re-verifies pre-verification-era successes and either attaches
+            # the passing report or downgrades the result.
         )
     return ProofResult(
         success=False,
@@ -544,12 +802,14 @@ def _substitute_proof(lean: str, name: str, proof_body: str) -> str:
     Tolerant of whitespace/newlines between `by` and `sorry_using` (the model
     doesn't always keep them on one line), and uses a replacement function
     (not a template string) so backslashes in `proof_body` aren't
-    misinterpreted as regex group references.
+    misinterpreted as regex group references. The body is normalized first -
+    this used to prepend its own `:= ` to a `:= by ...` body and emit
+    `:= := by ...`, which can never compile.
     """
     pattern = rf"(theorem|lemma)\s+{re.escape(name)}(.*?):=\s*by\s*sorry_using\s*\[.*?\]"
     return re.sub(
         pattern,
-        lambda m: f"{m.group(1)} {name}{m.group(2)}:= {proof_body}",
+        lambda m: f"{m.group(1)} {name}{m.group(2)}{format_proof_assign(proof_body)}",
         lean,
         flags=re.DOTALL,
     )

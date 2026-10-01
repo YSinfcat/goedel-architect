@@ -18,7 +18,7 @@ VSB_LEAN_SRC = VSB_ROOT / "data" / "lean_repos"
 sys.path.insert(0, str(VSB_ROOT))
 
 from core.lean_interface import LeanREPL
-from lean_compiler import AbstractLeanCompiler, CompilerResult
+from lean_compiler import AbstractLeanCompiler, CompilerResult, _reject_forbidden_constructs
 from blueprint import strip_blueprint_attr, lemma_to_theorem
 
 BLUEPRINT_COMPILE_TIMEOUT = 120  # seconds
@@ -88,6 +88,12 @@ class VSBLeanCompiler(AbstractLeanCompiler):
         so the blueprint's type signatures can elaborate correctly.
         Writes a temp .lean file, runs `lake env lean`, then deletes the file.
         """
+        # Same first-layer filter the default LeanCompiler applies - this
+        # path runs model-generated Lean directly and previously skipped the
+        # forbidden-construct check entirely.
+        rejected = _reject_forbidden_constructs(lean_code)
+        if rejected is not None:
+            return rejected
         entry = self.theorem_entry
         lean_root = entry.get("lean_root", "")
         repo_root = VSB_LEAN_SRC / lean_root
@@ -148,6 +154,15 @@ class VSBLeanCompiler(AbstractLeanCompiler):
         """
         if not proof_body.strip():
             return CompilerResult(success=False, errors=["proof_body is empty"])
+
+        # The VSB harness (format_generated_lean / LeanREPL.verify_proof)
+        # splices proof_body directly after the bare signature, so it needs
+        # the ':= ' prefix present. Canonical internal bodies are 'by ...'
+        # (see lean_compiler.normalize_proof_body) - add the assignment here
+        # if a caller passed one in that form, instead of guessing on the
+        # consumer side.
+        if not proof_body.lstrip().startswith(":="):
+            proof_body = ":= " + proof_body.strip()
 
         self._count += 1
         entry = self.theorem_entry

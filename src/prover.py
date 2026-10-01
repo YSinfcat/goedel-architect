@@ -73,15 +73,15 @@ likely already visible.
 
 Workflow:
 1. Draft a proof using the visible repo definitions.
-2. Call lean_compile with your proof_body (starting with `:= by` — the harness
-   appends proof_body directly after the bare theorem signature, so the leading
-   `:=` is required or the submission fails to parse).
+2. Call lean_compile with your proof_body — the tactic block starting with
+   `by` (a `:= by`-prefixed body is also accepted; the harness normalizes
+   either form and owns the single `:=` assignment when splicing).
 3. Read errors, adjust, call lean_compile again.
 4. When you need a lemma whose name you do NOT already know:
    - call repo_search for project-specific lemmas
    - call mathlib_search for general Mathlib lemmas
 5. Once lean_compile returns SUCCESSFUL, output:
-   <lean4_proof>:= by\n  ...\n</lean4_proof>
+   <lean4_proof>by\n  ...\n</lean4_proof>
 
 Prefer lean_compile over search — faster to try a tactic and read the error.
 """
@@ -101,9 +101,9 @@ TOOLS: list[dict[str, Any]] = [
                     "proof_body": {
                         "type": "string",
                         "description": (
-                            "Proof term starting with ':= by' (the leading ':=' is required — "
-                            "this gets appended directly after the bare theorem signature). "
-                            "Do NOT include the theorem declaration."
+                            "Tactic block starting with 'by' (a ':= by' prefix is also "
+                            "accepted and normalized away - do NOT include the theorem "
+                            "declaration)."
                         ),
                     },
                     "aux_lemmas": {
@@ -157,7 +157,13 @@ TOOLS: list[dict[str, Any]] = [
 
 class ProofSignal(str, Enum):
     SOLVED = "solved"
+    # Legacy value kept ONLY so checkpoints written before the downgrade can
+    # still be deserialized. Nothing produces it anymore: a model *saying* the
+    # statement looks false is not evidence, so new results use
+    # MODEL_SUSPECTS_WRONG (advisory) and only the (default-off, experimental)
+    # negation probe can still emit FORMALLY_NEGATED.
     STATEMENT_WRONG = "statement_wrong"
+    MODEL_SUSPECTS_WRONG = "model_suspects_wrong"
     PROOF_TOO_HARD = "proof_too_hard"
     FORMALLY_NEGATED = "formally_negated"
     # Not one of the paper's four signals: an infra/tooling failure (timeout,
@@ -165,6 +171,14 @@ class ProofSignal(str, Enum):
     # couldn't" verdict. Kept distinct so refinement (and human diagnosis)
     # doesn't treat a broken harness as evidence the sub-goal is hard.
     INFRA_ERROR = "infra_error"
+
+    @property
+    def advisory_statement_suspect(self) -> bool:
+        """True for the downgraded text-based 'statement looks false' signals
+        (current MODEL_SUSPECTS_WRONG and legacy STATEMENT_WRONG checkpoints).
+        Refinement must treat these as diagnostics, never as license to
+        rewrite the mathematical statement."""
+        return self in (ProofSignal.MODEL_SUSPECTS_WRONG, ProofSignal.STATEMENT_WRONG)
 
 
 @dataclass
@@ -209,6 +223,7 @@ class GoedelProver:
         tracer=None,
         api_timeout_s: float = 120.0,
         max_tool_calls: int | None = None,
+        enable_negation_probe: bool = False,
     ):
         self.model_id = model_id
         # Bounds each individual chat.completions call so a stuck request
@@ -222,6 +237,16 @@ class GoedelProver:
         # attempt a much tighter budget (e.g. 1: a single lean_compile call,
         # no fix-and-retry loop) than the cheap cascade attempt gets.
         self.max_tool_calls = max_tool_calls if max_tool_calls is not None else MAX_TOOL_CALLS
+        # The negation probe claims FORMALLY_NEGATED, but it never actually
+        # compiles a `Not <node proposition>` goal - it feeds the model's
+        # proof_body to the same checker as a POSITIVE proof (no negated
+        # node_decl is constructed), so a positive proof of a TRUE statement
+        # passes and gets mislabeled as a formal refutation. This poisoned
+        # refinement (which treated FORMALLY_NEGATED as machine-checked and
+        # locked the node). Default-off until the probe constructs the real
+        # negated goal via the Lean meta API; enable explicitly only for
+        # experiments that treat its output as MODEL_SUSPECTS_FALSE-grade.
+        self.enable_negation_probe = enable_negation_probe
 
     def _emit_usage(self, node_name: str, response) -> None:
         """Log token usage from a chat.completions response."""
@@ -405,10 +430,14 @@ class GoedelProver:
             )
             all_lean_errors.extend(final_errors)
 
-        # Probe negation if we couldn't prove it
-        negation = self._probe_negation(compiler, node_name, messages, MAX_TOKENS)
-        if negation:
-            return negation
+        # Probe negation if we couldn't prove it. Default-off: the probe
+        # doesn't construct a real `Not P` goal (see __init__), so a positive
+        # proof of a true statement can pass it and be mislabeled
+        # FORMALLY_NEGATED - which refinement then treats as ground truth.
+        if self.enable_negation_probe:
+            negation = self._probe_negation(compiler, node_name, messages, MAX_TOKENS)
+            if negation:
+                return negation
 
         if best_proof_body:
             signal = _classify_failure(last_text)
@@ -470,13 +499,24 @@ class GoedelProver:
 
         for tc in msg.tool_calls or []:
             fn = tc.function.name
-            args = json.loads(tc.function.arguments)
+            args = _safe_tool_args(tc)
             tools_called.append(fn)
 
             self.tracer.emit(TraceEvent(
                 kind="tool_call", thm_name=node_name, turn=turn,
                 call_id=tc.id, tool_name=fn, args=args,
             ))
+
+            if "__parse_error__" in args:
+                # Malformed tool-argument JSON: tell the model instead of
+                # crashing the node's whole tool loop.
+                result = args["__parse_error__"] + "\nRe-call the tool with valid JSON arguments."
+                self.tracer.emit(TraceEvent(
+                    kind="tool_result", thm_name=node_name, turn=turn,
+                    call_id=tc.id, result=result[:500],
+                ))
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                continue
 
             if fn == "lean_compile":
                 proof_body = args.get("proof_body", "")
@@ -572,7 +612,11 @@ class GoedelProver:
 
             for tc in msg.tool_calls:
                 if tc.function.name == "lean_compile":
-                    args = json.loads(tc.function.arguments)
+                    args = _safe_tool_args(tc)
+                    if "__parse_error__" in args:
+                        output = args["__parse_error__"] + "\nRe-call lean_compile with valid JSON arguments."
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+                        continue
                     parent_decls = getattr(self, "_parent_lemma_decls", "")
                     cr = compiler.check(args.get("proof_body", ""), aux_lemmas=parent_decls)
                     if cr.success:
@@ -603,6 +647,19 @@ class GoedelProver:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _safe_tool_args(tc) -> dict:
+    """Parse a tool call's arguments JSON defensively. A model emitting
+    malformed JSON used to raise straight out of the tool loop and kill the
+    whole node (and, pre-orchestrator-guard, the whole wave); instead the
+    caller feeds the parse error back to the model as the tool result so it
+    can retry with valid JSON."""
+    try:
+        parsed = json.loads(tc.function.arguments or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, TypeError) as exc:
+        return {"__parse_error__": f"tool arguments were not valid JSON: {exc}"}
+
+
 def _extract_proof_body(text: str) -> str:
     import re
     m = re.search(r"<lean4_proof>(.*?)</lean4_proof>", text, re.DOTALL)
@@ -610,18 +667,16 @@ def _extract_proof_body(text: str) -> str:
 
 
 def _classify_failure(analysis: str) -> ProofSignal:
-    """`STATEMENT_WRONG` is reserved for cases with real evidence of falsity:
-    `_probe_negation` formally proving the negation (a separate signal,
-    FORMALLY_NEGATED) or the model's own analysis explicitly claiming
-    false/counterexample (word-boundary matched so identifiers like
-    `t_false`/`progress_false` don't false-positive on the bare substring
-    "false"). A compiler "type mismatch" is NOT such evidence - it's one of
-    the most generic Lean elaboration errors and fires for merely-wrong
-    tactics/lemma applications on true theorems just as often as on false
-    ones, so it must not be used to infer the goal itself is false."""
+    """The model's own text mentioning "false"/"counterexample" downgrades to
+    MODEL_SUSPECTS_WRONG: an advisory diagnostic, NOT evidence. Only the
+    negation probe (default-off, experimental) can emit FORMALLY_NEGATED, and
+    refinement must not rewrite a mathematical statement on the model's word
+    alone. A compiler "type mismatch" was never such evidence either - it's
+    one of the most generic Lean elaboration errors and fires for merely-
+    wrong tactics on true theorems just as often as on false ones."""
     analysis_lower = analysis.lower()
     if re.search(r"\b(false|counterexample)\b", analysis_lower):
-        return ProofSignal.STATEMENT_WRONG
+        return ProofSignal.MODEL_SUSPECTS_WRONG
     return ProofSignal.PROOF_TOO_HARD
 
 
@@ -643,6 +698,7 @@ def prove_node(
     tracer=None,
     api_timeout_s: float = 120.0,
     max_tool_calls: int | None = None,
+    enable_negation_probe: bool = False,
 ) -> ProverResult:
     parent_block = "\n\n".join(
         f"```lean\n-- {n}\n{p}\n```" for n, p in parent_proofs.items()
@@ -655,7 +711,8 @@ def prove_node(
         parent_proofs=parent_block,
     )
     prover = GoedelProver(model_id=model, retrieval=retrieval, tracer=tracer,
-                           api_timeout_s=api_timeout_s, max_tool_calls=max_tool_calls)
+                           api_timeout_s=api_timeout_s, max_tool_calls=max_tool_calls,
+                           enable_negation_probe=enable_negation_probe)
     return prover.prove_node(
         compiler=compiler,
         node_name=node_name,

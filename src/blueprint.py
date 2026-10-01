@@ -431,6 +431,99 @@ def _extract_lean_code(content: str) -> str:
     return content.strip()
 
 
+class BlueprintValidationError(RuntimeError):
+    """Raised when a blueprint fails structural validation and must not
+    enter Phase 2 (see validate_blueprint)."""
+
+
+def validate_blueprint(blueprint: Blueprint) -> list[str]:
+    """Central structural validator for a blueprint DAG.
+
+    Single source of truth for graph shape, applied identically after
+    Phase 1 generation, on resume from checkpoints, and after Phase 3
+    refinement. Checks:
+      - every node name is unique
+      - every dependency names a declared node
+      - the dependency graph is acyclic
+      - the target theorem exists
+      - every node is reachable from the target (no dead nodes)
+
+    Returns a list of human-readable errors; empty list means the graph is
+    structurally sound. This is deliberately pure Python over the parsed
+    node list - it does not need Lean and runs everywhere, including the
+    no-compiler (compiler_factory-only) VSB path where check_blueprint may
+    only have performed a structural fallback.
+    """
+    errors: list[str] = []
+    nodes = blueprint.nodes
+    names = [n.name for n in nodes]
+    name_set = set(names)
+    target = blueprint.target_theorem
+
+    if len(name_set) != len(names):
+        seen: set[str] = set()
+        for n in names:
+            if n in seen:
+                errors.append(f"Duplicate node name '{n}'.")
+            seen.add(n)
+    if target not in name_set:
+        errors.append(f"Target theorem '{target}' is not a declared node.")
+
+    deps: dict[str, list[str]] = {}
+    for n in nodes:
+        for d in n.dependencies:
+            if d not in name_set:
+                errors.append(f"Node '{n.name}' depends on undeclared node '{d}'.")
+        deps[n.name] = [d for d in n.dependencies if d in name_set]
+
+    # Cycle detection (iterative DFS with a tri-color marking).
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in name_set}
+    for start in name_set:
+        if color[start] != WHITE:
+            continue
+        stack = [(start, iter(deps.get(start, [])))]
+        color[start] = GRAY
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for dep in it:
+                if color[dep] == GRAY:
+                    errors.append(f"Dependency cycle detected involving node '{dep}'.")
+                    # Mark everything black to avoid duplicate reports.
+                    for s, _ in stack:
+                        color[s] = BLACK
+                    color[dep] = BLACK
+                    advanced = True
+                    break
+                if color[dep] == WHITE:
+                    color[dep] = GRAY
+                    stack.append((dep, iter(deps.get(dep, []))))
+                    advanced = True
+                    break
+            if not advanced:
+                color[node] = BLACK
+                stack.pop()
+
+    # Reachability from the target: dead nodes can never contribute to the
+    # main theorem and usually mean the refinement renamed/split something
+    # and left orphans behind.
+    if target in name_set:
+        reachable: set[str] = set()
+        stack = [target]
+        while stack:
+            cur = stack.pop()
+            if cur in reachable:
+                continue
+            reachable.add(cur)
+            stack.extend(deps.get(cur, []))
+        for n in nodes:
+            if n.name not in reachable:
+                errors.append(f"Dead node '{n.name}' is unreachable from target '{target}'.")
+
+    return errors
+
+
 def _parse_blueprint(lean_code: str, target_theorem: str) -> Blueprint:
     """
     Parse @[blueprint]-annotated Lean code into a Blueprint datastructure.

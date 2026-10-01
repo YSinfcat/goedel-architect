@@ -16,7 +16,8 @@ from llm_client import make_client
 PUTNAM_DIR = Path(__file__).parent.parent / "data" / "putnam"
 
 
-def _prove_in_subprocess(theorem_stmt, nl_proof, model, max_iterations, trace_path, queue):
+def _prove_in_subprocess(theorem_stmt, nl_proof, model, max_iterations, trace_path, queue,
+                         allow_unvalidated_blueprint=False, enable_negation_probe=False):
     """Runs in a forked child process so a timeout can SIGKILL real work,
     not just abandon a thread that keeps burning API calls in the background.
     """
@@ -30,6 +31,8 @@ def _prove_in_subprocess(theorem_stmt, nl_proof, model, max_iterations, trace_pa
         model=model,
         max_iterations=max_iterations,
         tracer=tracer,
+        allow_unvalidated_blueprint=allow_unvalidated_blueprint,
+        enable_negation_probe=enable_negation_probe,
     )
     queue.put(result)
 
@@ -94,6 +97,13 @@ def main() -> None:
                              "The paper doesn't report wall-clock time at all, only token/dollar "
                              "cost, so this has no paper-derived value -- it's purely to stop one "
                              "stuck problem from eating the whole batch's time budget.")
+    parser.add_argument("--allow-unvalidated-blueprint", action="store_true",
+                        help="Debugging escape: let blueprints that never passed a real Lean "
+                             "compile into Phase 2. Success still requires independent final "
+                             "verification, so this cannot manufacture a fake success.")
+    parser.add_argument("--enable-negation-probe", action="store_true",
+                        help="Enable the experimental FORMALLY_NEGATED probe (known flaw: it "
+                             "never compiles a real negated goal - treat its output as advisory).")
     args = parser.parse_args()
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +149,8 @@ def main() -> None:
                 queue = ctx.Queue()
                 proc = ctx.Process(
                     target=_prove_in_subprocess,
-                    args=(stmt, nl_proof, args.model, args.max_iterations, problem_trace_path, queue),
+                    args=(stmt, nl_proof, args.model, args.max_iterations, problem_trace_path, queue,
+                          args.allow_unvalidated_blueprint, args.enable_negation_probe),
                 )
                 proc.start()
                 proc.join(timeout=args.timeout)

@@ -58,7 +58,7 @@ _PROOF_SKETCH_ATTR_RE = re.compile(r'\(proof\s*:=\s*/--.*?-/\)\s*', re.DOTALL)
 # text, used to summarize rounds too old to replay in full (see
 # _summarize_dropped_rounds).
 _VERDICT_RE = re.compile(
-    r'(?:lemma|theorem)\s+(\w+).*?\n--\s*(PROVED|UNPROVED|FORMALLY_NEGATED|INFRA_ERROR)',
+    r'(?:lemma|theorem)\s+(\w+).*?\n--\s*(PROVED|UNPROVED|FORMALLY_NEGATED|INFRA_ERROR|MODEL_SUSPECTS_WRONG)',
     re.DOTALL,
 )
 
@@ -115,9 +115,12 @@ def refine_blueprint(
     # round), so re-sending it in full on every refinement round is a fixed
     # cost multiplied by however many rounds run. Only the first round gets
     # it verbatim to bootstrap understanding; later rounds fall back on the
-    # live repo_search tool (already wired in via repo_retrieval above) for
-    # anything they still need to look up.
-    effective_repo_context = repo_context if iteration == 0 else None
+    # live repo_search tool for anything they still need to look up. But
+    # when NO repo_search tool is configured (repo_retrieval is None), the
+    # later rounds used to drop the context with nothing to replace it -
+    # silently blinding refinement to repo definitions mid-run. Keep the
+    # full block in that case.
+    effective_repo_context = repo_context if (iteration == 0 or repo_retrieval is None) else None
     messages = [
         {"role": "system", "content": system_content},
         {"role": "user", "content": _build_refinement_user_prompt(
@@ -217,6 +220,18 @@ def _annotate_with_verdicts(blueprint: Blueprint, orch_result: OrchestratorResul
                     output_lines.append(
                         "-- INFRA_ERROR (infrastructure/tooling failure, not a "
                         "genuine proof-difficulty signal)"
+                    )
+                    output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
+                elif nr.result.signal.advisory_statement_suspect:
+                    # Downgraded text-based "statement looks false" verdicts
+                    # (MODEL_SUSPECTS_WRONG, and legacy STATEMENT_WRONG
+                    # checkpoints). Advisory only - the refinement model may
+                    # READ the diagnosis, but must not rewrite the statement
+                    # on the model's word alone (see refinement_system.md).
+                    output_lines.append(
+                        "-- MODEL_SUSPECTS_WRONG (advisory - the prover model "
+                        "claims falsity without formal evidence; do NOT change "
+                        "the statement because of this marker)"
                     )
                     output_lines.append(_truncate_diagnosis(nr.result.diagnosis_block(name)))
                 else:

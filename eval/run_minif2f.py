@@ -37,6 +37,13 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Max problems to run")
     parser.add_argument("--output", default="results/minif2f_results.jsonl")
     parser.add_argument("--max-iterations", type=int, default=8)
+    parser.add_argument("--allow-unvalidated-blueprint", action="store_true",
+                        help="Debugging escape: let blueprints that never passed a real Lean "
+                             "compile into Phase 2. Success still requires independent final "
+                             "verification, so this cannot manufacture a fake success.")
+    parser.add_argument("--enable-negation-probe", action="store_true",
+                        help="Enable the experimental FORMALLY_NEGATED probe (known flaw: it "
+                             "never compiles a real negated goal - treat its output as advisory).")
     args = parser.parse_args()
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -59,6 +66,8 @@ def main() -> None:
                     nl_proof=nl_proof,
                     model=args.model,
                     max_iterations=args.max_iterations,
+                    allow_unvalidated_blueprint=args.allow_unvalidated_blueprint,
+                    enable_negation_probe=args.enable_negation_probe,
                 )
                 elapsed = time.time() - t0
                 status = "SOLVED" if result.success else "FAILED"

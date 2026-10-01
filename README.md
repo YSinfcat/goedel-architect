@@ -1,9 +1,47 @@
 # goedel-arch
 
+> **Research preview.** This is a research prototype, not a verified theorem
+> prover. A `success=True` result now requires an independent final Lean
+> compilation of the assembled proofs against the **original** theorem
+> statement, but known limitations remain — see [Known limitations](#known-limitations).
+> Do not cite benchmark numbers from commits predating this verification
+> chain without re-running them.
+
 An implementation of the Goedel-Architect pipeline for Lean 4 theorem proving:
 decompose a theorem into a dependency graph of sub-lemmas (Phase 1), prove each
 node in parallel (Phase 2), and refine the decomposition when nodes fail
 (Phase 3), repeating up to a fixed number of iterations.
+
+## Verification chain
+
+Results are only reported as successful after passing, in order:
+
+1. **Blueprint gate** — the Phase 1/3 skeleton must compile in Lean *and*
+   pass structural validation (unique names, known dependencies, acyclic,
+   no dead nodes, target present). A blueprint that never passed a real
+   compile is refused entry to Phase 2 unless `allow_unvalidated_blueprint`
+   is explicitly set (debugging only).
+2. **Per-node proofs** — every node's proof must compile on its own, with
+   `axiom`/`native_decide` rejected outright.
+3. **Independent final verification** — the root proof plus all auxiliary
+   lemmas are spliced into the *original, immutable* theorem statement and
+   compiled once more. A blueprint that quietly weakened the main theorem's
+   signature fails here. Only after this pass may `success=True` be set, on
+   results and checkpoints alike; resumed checkpoints claiming pre-fix
+   successes are re-verified on load and downgraded if they no longer hold.
+
+## Known limitations
+
+- The negation probe (`FORMALLY_NEGATED`) is **disabled by default**: it
+  never constructed a real `¬P` goal, so a positive proof of a true
+  statement could pass it and be mislabeled as a refutation. Enable it only
+  for experiments that treat its output as advisory (`MODEL_SUSPECTS_WRONG`
+  is the advisory form used for text-based falsity claims).
+- Model-generated Lean runs via `lake env lean` on this machine with only a
+  regex-level filter for forbidden constructs — there is no OS-level
+  sandboxing (container, seccomp, resource limits) yet.
+- Checkpoints do not yet carry a run fingerprint (code commit, prompt
+  hashes, toolchain); `--resume` compares theorem/model/blueprint only.
 
 ## Requirements
 

@@ -14,7 +14,7 @@ from typing import Callable
 import networkx as nx
 
 from blueprint import Blueprint, BlueprintNode
-from lean_compiler import AbstractLeanCompiler
+from lean_compiler import AbstractLeanCompiler, normalize_proof_body
 from mathlib_retrieval import MathlibRetrieval
 from prover import ProofSignal, ProverResult, prove_node
 from tracer import NullTracer
@@ -95,6 +95,7 @@ async def prove_dag(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = 1,
+    enable_negation_probe: bool = False,
 ) -> OrchestratorResult:
     """
     Prove all nodes in the blueprint DAG in parallel waves.
@@ -197,6 +198,7 @@ async def prove_dag(
                 cascade_model=cascade_model,
                 cascade_timeout_s=cascade_timeout_s,
                 escalation_max_tool_calls=escalation_max_tool_calls,
+                enable_negation_probe=enable_negation_probe,
             )
             for name in wave
         ]
@@ -205,7 +207,9 @@ async def prove_dag(
         for nr in wave_results:
             orch_result.node_results[nr.node.name] = nr
             if nr.result.signal == ProofSignal.SOLVED:
-                proof_bodies[nr.node.name] = nr.result.proof_body
+                # Canonical `by ...` form at rest - every later splice site
+                # adds its own single `:=` (see lean_compiler.normalize_proof_body).
+                proof_bodies[nr.node.name] = normalize_proof_body(nr.result.proof_body)
 
     return orch_result
 
@@ -224,6 +228,7 @@ async def _prove_one(
     cascade_model: str | None = None,
     cascade_timeout_s: float | None = None,
     escalation_max_tool_calls: int | None = None,
+    enable_negation_probe: bool = False,
 ) -> NodeResult:
     node = blueprint.node_by_name(name)
     assert node is not None
@@ -270,6 +275,7 @@ async def _prove_one(
                 repo_retrieval=repo_retrieval,
                 tracer=tracer,
                 max_tool_calls=max_tool_calls,
+                enable_negation_probe=enable_negation_probe,
             ),
         )
         try:

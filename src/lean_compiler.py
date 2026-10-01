@@ -56,20 +56,70 @@ _SORRY_USING_RE = re.compile(r":=\s*by\s*sorry_using\s*\[[^\]]*\]", re.DOTALL)
 _FORBIDDEN_CONSTRUCT_RE = re.compile(r"\baxiom\b|\bnative_decide\b")
 
 
+class MalformedProofBody(ValueError):
+    """A proof body that cannot be normalized into the canonical `by ...`
+    form (e.g. a `:= := by ...` double-assignment leftover)."""
+
+
+def normalize_proof_body(body: str) -> str:
+    """Canonical internal proof-body form: starts with `by` (or a bare
+    term), NEVER with `:=`.
+
+    Exactly one representation exists at rest (proved caches, checkpoints,
+    ProofResult payloads); every site that splices a proof into a
+    declaration adds the `:= ` assignment itself via format_proof_assign().
+    This makes the historical `:= := by ...` double-assembly bug impossible:
+    a leading `:=` is stripped here (model-facing schemas ask for `:= by`),
+    and a body that still starts with `:=` after one strip is a double
+    leftover that must fail loudly instead of silently compiling garbage.
+    """
+    b = (body or "").strip()
+    if b.startswith(":="):
+        b = b[2:].lstrip()
+    if b.startswith(":="):
+        raise MalformedProofBody(
+            f"proof body still starts with ':=' after normalization "
+            f"(double-assignment leftover): {b[:60]!r}"
+        )
+    return b
+
+
+def format_proof_assign(body: str) -> str:
+    """Render a proof body with exactly one leading `:= ` assignment."""
+    return ":= " + normalize_proof_body(body)
+
+
 def _assemble_node_attempt(node_decl: str, aux_lemmas: str, proof_body: str) -> str:
     """Build a standalone compilable file from a blueprint node's declaration.
 
     Strips the `@[blueprint ...]` attribute and swaps `:= by sorry_using [...]`
-    for `:= ` + the prover's tactic proof.
+    for `:= ` + the prover's tactic proof (normalized - the model-facing tool
+    schema historically asked for a `:= by`-prefixed body, which used to
+    re-assemble as `:= := by ...` and could never compile).
     """
     m = _DECL_RE.search(node_decl)
     decl_text = m.group(0) if m else node_decl
-    decl_text = _SORRY_USING_RE.sub(f":= {proof_body}", decl_text, count=1)
+    decl_text = _SORRY_USING_RE.sub(lambda _: f":= {normalize_proof_body(proof_body)}", decl_text, count=1)
     parts = [MATHLIB_HEADER.rstrip("\n")]
     if aux_lemmas.strip():
         parts.append(aux_lemmas.strip())
     parts.append(decl_text)
     return "\n\n".join(parts) + "\n"
+
+
+def _reject_forbidden_constructs(code: str) -> CompilerResult | None:
+    """First-layer fast filter over code about to be compiled. This is NOT a
+    security sandbox (Lean metaprogramming is Turing-complete); it only
+    enforces the proof-integrity bans the prompts already state. See
+    README's known limitations."""
+    hit = _FORBIDDEN_CONSTRUCT_RE.search(code)
+    if hit is None:
+        return None
+    return CompilerResult(
+        success=False,
+        errors=[f"Safeguard rejected: forbidden construct `{hit.group(0)}` is not allowed."],
+        raw_output="Safeguard rejected",
+    )
 
 
 class AbstractLeanCompiler(ABC):
@@ -120,13 +170,9 @@ class LeanCompiler(AbstractLeanCompiler):
         else:
             code = (MATHLIB_HEADER + lean_code) if prepend_header else lean_code
 
-        forbidden = _FORBIDDEN_CONSTRUCT_RE.search(code)
-        if forbidden:
-            return CompilerResult(
-                success=False,
-                errors=[f"Safeguard rejected: forbidden construct `{forbidden.group(0)}` is not allowed."],
-                raw_output="Safeguard rejected",
-            )
+        forbidden = _reject_forbidden_constructs(code)
+        if forbidden is not None:
+            return forbidden
 
         result = self._run_lean(code)
         if result.success and result.has_sorry:
@@ -156,6 +202,12 @@ class LeanCompiler(AbstractLeanCompiler):
                 code = GOEDEL_HEADER + lean_code
         else:
             code = lean_code
+        # Blueprint code previously bypassed the forbidden-construct filter
+        # entirely (it calls _run_lean directly) - a blueprint containing
+        # `axiom` or `native_decide` would sail through Phase 1 validation.
+        forbidden = _reject_forbidden_constructs(code)
+        if forbidden is not None:
+            return forbidden
         code = code.rstrip() + f"\n\n#validate_blueprint {target_name}\n"
         return self._run_lean(code)
 
