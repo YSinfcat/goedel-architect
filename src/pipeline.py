@@ -19,6 +19,7 @@ from typing import Callable
 from blueprint import Blueprint, BlueprintValidationError, generate_blueprint, validate_blueprint
 from checkpoint import CheckpointState
 from artifacts import write_success_artifact
+from interventions import autonomy_label
 from lineage import compute_lineage, lineage_snapshot
 from run_fingerprint import fingerprint, run_manifest, skip_requested
 from lean_compiler import (
@@ -72,12 +73,15 @@ class ProofResult:
     proved_nodes: list[str] = field(default_factory=list)
     failed_nodes: list[str] = field(default_factory=list)
     final_verification: VerificationReport | None = None
+    # fully_autonomous | human_guided | human_written (interventions.py)
+    autonomy: str = "fully_autonomous"
 
 
 def _invalidate_stale_proofs(
     new_blueprint: Blueprint,
     proved_cache: dict[str, str],
     proof_cache_keys: dict[str, str],
+    locked_nodes: list[str] | None = None,
 ) -> dict[str, str]:
     """Drop cached proofs that no longer match the node they were compiled against.
 
@@ -100,6 +104,11 @@ def _invalidate_stale_proofs(
     """
     pruned = dict(proved_cache)
     for name in list(pruned):
+        if name in locked_nodes:
+            # Human-locked proofs survive graph reshaping by design; the
+            # final verification against the ORIGINAL theorem remains the
+            # backstop if the lock no longer typechecks.
+            continue
         new_node = new_blueprint.node_by_name(name)
         if new_node is None or proof_cache_keys.get(name) != new_node.cache_key():
             del pruned[name]
@@ -141,7 +150,8 @@ def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_na
 def _write_artifact_safely(artifact_dir, *, theorem_name, verification,
                             manifest, blueprint_initial, blueprint_final,
                             fallback_lean, trace_path,
-                            lineage_history=None) -> None:
+                            lineage_history=None, autonomy="fully_autonomous",
+                            interventions=None) -> None:
     """Best-effort success artifact (review IV.8): a write failure is
     reported but never converts a verified proof into a failed run."""
     try:
@@ -155,6 +165,8 @@ def _write_artifact_safely(artifact_dir, *, theorem_name, verification,
             blueprint_initial=blueprint_initial, blueprint_final=blueprint_final,
             trace_path=trace_path,
             lineage_history=lineage_history,
+            autonomy=autonomy,
+            interventions=interventions,
         )
         print(f"  [artifact] success bundle written to {out}", flush=True)
     except Exception as exc:
@@ -400,6 +412,7 @@ async def prove_theorem_async(
                     proved_nodes=cached.proved_nodes,
                     failed_nodes=cached.failed_nodes,
                     final_verification=verification,
+                    autonomy=autonomy_label(state),
                 )
             cached.final_verification = verification
         return cached
@@ -579,6 +592,8 @@ async def prove_theorem_async(
                         fallback_lean=_assemble_partial_file(blueprint, None, proved_cache),
                         trace_path=getattr(tracer, "path", None),
                         lineage_history=state.lineage_history if checkpoint_path else [],
+                        autonomy=autonomy_label(state),
+                        interventions=state.interventions if checkpoint_path else [],
                     )
                 return ProofResult(
                     success=True,
@@ -590,6 +605,7 @@ async def prove_theorem_async(
                     proved_nodes=list(orch_result.proved),
                     failed_nodes=[],
                     final_verification=verification,
+                    autonomy=autonomy_label(state),
                 )
 
         if checkpoint_path:
@@ -642,10 +658,12 @@ async def prove_theorem_async(
                 state.save(checkpoint_path)
             break  # refinement failed, stop iterations
 
-        stale = set(proved_cache) - set(_invalidate_stale_proofs(blueprint, proved_cache, proof_cache_keys))
+        stale = set(proved_cache) - set(_invalidate_stale_proofs(
+            blueprint, proved_cache, proof_cache_keys, state.locked_nodes))
         if stale:
             print(f"  invalidated stale proof(s) (no longer match the current node shape): {sorted(stale)}", flush=True)
-        proved_cache = _invalidate_stale_proofs(blueprint, proved_cache, proof_cache_keys)
+        proved_cache = _invalidate_stale_proofs(
+            blueprint, proved_cache, proof_cache_keys, state.locked_nodes)
         proof_cache_keys = {name: key for name, key in proof_cache_keys.items() if name in proved_cache}
 
         # No-progress stop (review III.2): refinement sometimes oscillates -
@@ -717,6 +735,7 @@ async def prove_theorem_async(
         proved_nodes=proved,
         failed_nodes=failed,
         final_verification=last_verification,
+        autonomy=autonomy_label(state),
     )
 
 
@@ -999,7 +1018,8 @@ def run_phase3(
         thm_name=thm_name,
     )
 
-    new_proved_cache = _invalidate_stale_proofs(new_blueprint, state.proved_cache, state.proof_cache_keys)
+    new_proved_cache = _invalidate_stale_proofs(
+        new_blueprint, state.proved_cache, state.proof_cache_keys, state.locked_nodes)
     state.proved_cache = new_proved_cache
     state.proof_cache_keys = {
         name: key for name, key in state.proof_cache_keys.items() if name in new_proved_cache
@@ -1043,6 +1063,7 @@ def _proof_result_from_checkpoint(
             iterations=state.iteration + 1,
             proved_nodes=list(orch_result.proved),
             failed_nodes=[],
+            autonomy=autonomy_label(state),
             # final_verification is left None here on purpose: the caller
             # re-verifies pre-verification-era successes and either attaches
             # the passing report or downgrades the result.
@@ -1056,6 +1077,7 @@ def _proof_result_from_checkpoint(
         iterations=state.iteration + 1,
         proved_nodes=list(orch_result.proved),
         failed_nodes=list(orch_result.failed.keys()),
+        autonomy=autonomy_label(state),
     )
 
 

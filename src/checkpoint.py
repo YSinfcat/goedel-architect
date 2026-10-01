@@ -66,6 +66,13 @@ class CheckpointState:
     # list of round snapshots, each a list of entry dicts. Additive -
     # checkpoints written before this field exist simply have [].
     lineage_history: list = field(default_factory=list)
+    # Human intervention records (see src/interventions.py):
+    # {type, operator, node, before, after, reason, ts}. Additive.
+    interventions: list = field(default_factory=list)
+    # Nodes protected from stale-proof invalidation (review IV.3).
+    locked_nodes: list[str] = field(default_factory=list)
+    # name -> "model" | "human": where each cached proof came from.
+    proof_sources: dict[str, str] = field(default_factory=dict)
 
     # -- Blueprint (de)serialization -------------------------------------
 

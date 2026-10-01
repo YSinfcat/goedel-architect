@@ -105,6 +105,8 @@ def write_success_artifact(
     blueprint_final: Blueprint | None = None,
     trace_path: Path | None = None,
     lineage_history: list | None = None,
+    autonomy: str = "fully_autonomous",
+    interventions: list | None = None,
 ) -> Path:
     """Write the bundle; returns the directory. See module docstring."""
     out = Path(out_dir) / _safe(theorem_name)
@@ -126,6 +128,8 @@ def write_success_artifact(
         "mode": verification.mode,
         "performed": verification.performed,
         "errors": verification.errors,
+        "autonomy": autonomy,
+        "interventions": interventions,
         "lean_toolchain": manifest.get("lean_toolchain", "unknown"),
         "code_commit": manifest.get("code_commit", "unknown"),
         "run_fingerprint": manifest.get("fingerprint", ""),
