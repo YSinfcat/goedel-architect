@@ -49,6 +49,9 @@ def main() -> None:
                         help="Try a deterministic tactic list (simp/aesop/omega/...) "
                              "on each node before any model call - a hit costs zero "
                              "LLM tokens. Recorded in the run fingerprint.")
+    parser.add_argument("--artifacts", metavar="DIR", default=None,
+                        help="On success, write an auditable artifact bundle "
+                             "(proof.lean, blueprints, verification.json, ...) per theorem.")
     parser.add_argument("--retry-failed", action="store_true",
                         help="Continue past a checkpointed terminal failure (done=True, "
                              "success=False) instead of returning the cached verdict forever.")
@@ -79,6 +82,7 @@ def main() -> None:
                     retry_failed=args.retry_failed,
                     tactic_portfolio=(list(DEFAULT_TACTIC_PORTFOLIO)
                                       if args.tactic_portfolio else None),
+                    artifact_dir=Path(args.artifacts) if args.artifacts else None,
                 )
                 elapsed = time.time() - t0
                 status = "SOLVED" if result.success else "FAILED"

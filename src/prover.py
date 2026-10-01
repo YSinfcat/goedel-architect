@@ -287,9 +287,11 @@ class GoedelProver:
         nl_proof_sketch: str = "",
         repo_retrieval=None,
         parent_lemma_decls: str = "",
+        portfolio_failures: list[str] | None = None,
     ) -> ProverResult:
         """Attempt to prove a single node, timing it and emitting a final_verify trace event."""
         t0 = time.time()
+        user_prompt = user_prompt + _portfolio_note(portfolio_failures)
         result = self._prove_node_inner(
             compiler, node_name, node_stmt, sys_prompt, user_prompt,
             nl_statement, nl_proof_sketch, repo_retrieval,
@@ -677,6 +679,18 @@ def _safe_tool_args(tc) -> dict:
         return {"__parse_error__": f"tool arguments were not valid JSON: {exc}"}
 
 
+def _portfolio_note(failed_tactics: list[str] | None) -> str:
+    """Prompt suffix listing tactics the deterministic portfolio already
+    tried and the compiler rejected - the model should not burn tool calls
+    rediscovering them."""
+    if not failed_tactics:
+        return ""
+    return (f"\n\n-- Deterministic tactics already tried and REJECTED for this "
+            f"node: {', '.join(failed_tactics)}. Do not retry these unchanged; "
+            f"you need a different approach (a library lemma, a different "
+            f"tactic combination, or restructuring).")
+
+
 def _extract_proof_body(text: str) -> str:
     import re
     m = re.search(r"<lean4_proof>(.*?)</lean4_proof>", text, re.DOTALL)
@@ -716,6 +730,7 @@ def prove_node(
     api_timeout_s: float = 120.0,
     max_tool_calls: int | None = None,
     enable_negation_probe: bool = False,
+    portfolio_failures: list[str] | None = None,
 ) -> ProverResult:
     parent_block = "\n\n".join(
         f"```lean\n-- {n}\n{p}\n```" for n, p in parent_proofs.items()
@@ -726,7 +741,7 @@ def prove_node(
         nl_statement=node_statement_nl,
         nl_proof_sketch=node_proof_sketch_nl,
         parent_proofs=parent_block,
-    )
+    ) + _portfolio_note(portfolio_failures)
     prover = GoedelProver(model_id=model, retrieval=retrieval, tracer=tracer,
                            api_timeout_s=api_timeout_s, max_tool_calls=max_tool_calls,
                            enable_negation_probe=enable_negation_probe)

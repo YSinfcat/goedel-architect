@@ -56,20 +56,22 @@ class AllFailCompiler:
 
 class TestRunTacticPortfolio(unittest.TestCase):
     def test_hit_returns_solved_with_canonical_body(self):
-        result = run_tactic_portfolio(
+        result, failed = run_tactic_portfolio(
             OmegaOnlyCompiler(), LEAN, "", "main",
             tactics=["simp", "aesop", "omega"],
         )
         self.assertIsNotNone(result)
+        self.assertEqual(failed, ["simp", "aesop"])
         self.assertEqual(result.signal, ProofSignal.SOLVED)
         self.assertEqual(result.proof_body, "by omega")
         self.assertIn("simp", result.analysis)  # prior attempts recorded
 
     def test_exhaustion_returns_none(self):
-        result = run_tactic_portfolio(
+        result, failed = run_tactic_portfolio(
             AllFailCompiler(), LEAN, "", "main", tactics=["simp", "omega"],
         )
         self.assertIsNone(result)
+        self.assertEqual(failed, ["simp", "omega"])
 
 
 class TestPortfolioInDag(unittest.TestCase):

@@ -45,14 +45,18 @@ def run_tactic_portfolio(
     node_name: str,
     tactics: tuple[str, ...] | list[str] = DEFAULT_TACTIC_PORTFOLIO,
     tracer=None,
-) -> ProverResult | None:
+) -> tuple[ProverResult | None, list[str]]:
     """Try each tactic as a bare `by <tactic>` proof for the node.
 
-    Returns a SOLVED ProverResult on the first compiling tactic, or None
-    when the portfolio is exhausted (the caller falls through to the LLM).
+    Returns (result, failed_tactics): a SOLVED ProverResult plus [] on the
+    first compiling tactic, or None plus the list of tactics that were
+    tried and rejected. The failure list is fed into the subsequent LLM
+    prompt (see prover._portfolio_note) so the model doesn't burn tool
+    calls rediscovering that `simp` doesn't close this goal.
     """
     tracer = tracer or NullTracer()
     attempts: list[str] = []
+    failed: list[str] = []
     for tactic in tactics:
         proof = f"by {tactic}"
         result = compiler.check(proof, aux_lemmas=aux_lemmas, node_decl=node_decl)
@@ -69,10 +73,11 @@ def run_tactic_portfolio(
                 proof_body=proof,
                 analysis=f"closed by the deterministic tactic portfolio ({tactic}) "
                          f"before any model call; attempts: {', '.join(attempts)}",
-            )
+            ), failed
+        failed.append(tactic)
     tracer.emit(TraceEvent(
         kind="tactic_portfolio", thm_name=node_name, ok=False,
         args={"tactic": "<exhausted>"},
         result=f"portfolio exhausted without closing the goal: {', '.join(attempts)}",
     ))
-    return None
+    return None, failed

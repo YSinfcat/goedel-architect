@@ -293,8 +293,9 @@ async def _prove_one(
     # Deterministic first shot (review IV.5): try the cheap tactic list
     # through the same compile contract the prover uses; a hit closes the
     # node with zero model calls and never touches the cascade budget.
+    portfolio_failures: list[str] = []
     if tactic_portfolio:
-        portfolio_result = run_tactic_portfolio(
+        portfolio_result, portfolio_failures = run_tactic_portfolio(
             active_compiler, node.lean_declaration, parent_lemma_decls, name,
             tactics=tuple(tactic_portfolio), tracer=tracer,
         )
@@ -334,6 +335,7 @@ async def _prove_one(
                 tracer=tracer,
                 max_tool_calls=max_tool_calls,
                 enable_negation_probe=enable_negation_probe,
+                portfolio_failures=portfolio_failures or None,
             ),
         )
         try:

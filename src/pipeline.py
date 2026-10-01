@@ -18,6 +18,7 @@ from typing import Callable
 
 from blueprint import Blueprint, BlueprintValidationError, generate_blueprint, validate_blueprint
 from checkpoint import CheckpointState
+from artifacts import write_success_artifact
 from run_fingerprint import fingerprint, run_manifest, skip_requested
 from lean_compiler import (
     AbstractLeanCompiler,
@@ -48,6 +49,10 @@ class VerificationReport:
     passed: bool = False
     mode: str = ""       # "full-file" | "vsb-root-recheck" | "unavailable"
     errors: list[str] = field(default_factory=list)
+    # The exact full-file text that was compiled for a passing verification
+    # (full-file mode only) - recorded so a success artifact can ship the
+    # precise bytes the kernel accepted, not a re-derivation of them.
+    file_text: str = ""
 
 
 @dataclass
@@ -130,6 +135,28 @@ def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_na
         elif node.name in proved_cache:
             parts.append(f"{node.signature()} {format_proof_assign(proved_cache[node.name])}")
     return "\n\n".join(parts)
+
+
+def _write_artifact_safely(artifact_dir, *, theorem_name, verification,
+                            manifest, blueprint_initial, blueprint_final,
+                            fallback_lean, trace_path) -> None:
+    """Best-effort success artifact (review IV.8): a write failure is
+    reported but never converts a verified proof into a failed run."""
+    try:
+        out = write_success_artifact(
+            artifact_dir,
+            theorem_name=theorem_name,
+            # vsb-root-recheck mode verified a proof body rather than a full
+            # file; the closest auditable text is the assembled partial file
+            proof_lean=(verification.file_text or fallback_lean),
+            verification=verification, manifest=manifest,
+            blueprint_initial=blueprint_initial, blueprint_final=blueprint_final,
+            trace_path=trace_path,
+        )
+        print(f"  [artifact] success bundle written to {out}", flush=True)
+    except Exception as exc:
+        print(f"  [artifact] WARNING: failed to write success artifact "
+              f"({type(exc).__name__}: {exc}) - proof result unaffected", flush=True)
 
 
 def _gate_blueprint(blueprint: Blueprint, allow_unvalidated: bool, had_compiler: bool) -> None:
@@ -225,6 +252,7 @@ def _final_verification(
         return VerificationReport(
             performed=True, passed=result.success, mode="full-file",
             errors=result.errors,
+            file_text=file if result.success else "",
         )
     if compiler_factory is not None:
         try:
@@ -265,6 +293,7 @@ async def prove_theorem_async(
     enable_negation_probe: bool = False,
     retry_failed: bool = False,
     tactic_portfolio: list[str] | None = None,
+    artifact_dir: Path | None = None,
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -435,6 +464,9 @@ async def prove_theorem_async(
         _structure_fingerprint(blueprint): len(proved_cache)
     }
     stagnation_rounds = 0
+    # The graph as generated/resumed, before refinement rounds replace it -
+    # shipped in the success artifact as blueprint.initial.json.
+    initial_blueprint = blueprint
 
     for iteration in range(start_iteration, max_iterations):
         # Phase 2: Parallel proving
@@ -525,6 +557,15 @@ async def prove_theorem_async(
                     state.done = True
                     state.success = True
                     state.save(checkpoint_path)
+                if artifact_dir is not None:
+                    _write_artifact_safely(
+                        artifact_dir, theorem_name=root_name,
+                        verification=verification, manifest=manifest,
+                        blueprint_initial=initial_blueprint,
+                        blueprint_final=blueprint,
+                        fallback_lean=_assemble_partial_file(blueprint, None, proved_cache),
+                        trace_path=getattr(tracer, "path", None),
+                    )
                 return ProofResult(
                     success=True,
                     theorem_name=root_name,
@@ -674,6 +715,7 @@ def prove_theorem(
     enable_negation_probe: bool = False,
     retry_failed: bool = False,
     tactic_portfolio: list[str] | None = None,
+    artifact_dir: Path | None = None,
 ) -> ProofResult:
     """Synchronous wrapper around prove_theorem_async (review IV.5): the
     library no longer calls asyncio.run() deep inside a sync API, which
@@ -703,6 +745,7 @@ def prove_theorem(
         enable_negation_probe=enable_negation_probe,
         retry_failed=retry_failed,
         tactic_portfolio=tactic_portfolio,
+        artifact_dir=artifact_dir,
     ))
 
 

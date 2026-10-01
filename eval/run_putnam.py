@@ -19,7 +19,8 @@ PUTNAM_DIR = Path(__file__).parent.parent / "data" / "putnam"
 
 def _prove_in_subprocess(theorem_stmt, nl_proof, model, max_iterations, trace_path, queue,
                          allow_unvalidated_blueprint=False, enable_negation_probe=False,
-                         retry_failed=False, tactic_portfolio=None):
+                         retry_failed=False, tactic_portfolio=None,
+                         artifact_dir=None):
     """Runs in a forked child process so a timeout can SIGKILL real work,
     not just abandon a thread that keeps burning API calls in the background.
     """
@@ -38,6 +39,7 @@ def _prove_in_subprocess(theorem_stmt, nl_proof, model, max_iterations, trace_pa
         enable_negation_probe=enable_negation_probe,
         retry_failed=retry_failed,
         tactic_portfolio=list(tactic_portfolio) if tactic_portfolio else None,
+        artifact_dir=Path(artifact_dir) if artifact_dir else None,
     )
     queue.put(result)
 
@@ -113,6 +115,9 @@ def main() -> None:
                         help="Try a deterministic tactic list (simp/aesop/omega/...) "
                              "on each node before any model call - a hit costs zero "
                              "LLM tokens. Recorded in the run fingerprint.")
+    parser.add_argument("--artifacts", metavar="DIR", default=None,
+                        help="On success, write an auditable artifact bundle "
+                             "(proof.lean, blueprints, verification.json, ...) per theorem.")
     parser.add_argument("--retry-failed", action="store_true",
                         help="Continue past a checkpointed terminal failure (done=True, "
                              "success=False) instead of returning the cached verdict forever.")
@@ -164,7 +169,8 @@ def main() -> None:
                     args=(stmt, nl_proof, args.model, args.max_iterations, problem_trace_path, queue,
                           args.allow_unvalidated_blueprint, args.enable_negation_probe,
                           args.retry_failed,
-                          list(DEFAULT_TACTIC_PORTFOLIO) if args.tactic_portfolio else None),
+                          list(DEFAULT_TACTIC_PORTFOLIO) if args.tactic_portfolio else None,
+                          args.artifacts),
                 )
                 proc.start()
                 proc.join(timeout=args.timeout)
