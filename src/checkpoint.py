@@ -62,6 +62,10 @@ class CheckpointState:
     # Provenance manifest (run_fingerprint.run_manifest) + its hash under
     # "fingerprint". Empty dict = legacy schema-0 checkpoint.
     run_fingerprint: dict = field(default_factory=dict)
+    # Per-refinement-round node lineage snapshots (see src/lineage.py):
+    # list of round snapshots, each a list of entry dicts. Additive -
+    # checkpoints written before this field exist simply have [].
+    lineage_history: list = field(default_factory=list)
 
     # -- Blueprint (de)serialization -------------------------------------
 

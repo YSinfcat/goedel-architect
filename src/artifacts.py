@@ -104,6 +104,7 @@ def write_success_artifact(
     blueprint_initial: Blueprint | None = None,
     blueprint_final: Blueprint | None = None,
     trace_path: Path | None = None,
+    lineage_history: list | None = None,
 ) -> Path:
     """Write the bundle; returns the directory. See module docstring."""
     out = Path(out_dir) / _safe(theorem_name)
@@ -138,6 +139,10 @@ def write_success_artifact(
     (out / "model_usage.json").write_text(
         json.dumps(_aggregate_usage(trace_path), indent=2, ensure_ascii=False),
         encoding="utf-8")
+    if lineage_history:
+        (out / "lineage.json").write_text(
+            json.dumps(lineage_history, indent=2, ensure_ascii=False),
+            encoding="utf-8")
 
     readme = f"""# Proof artifact: {theorem_name}
 
@@ -156,6 +161,7 @@ Contents:
 - verification.json        what was checked (and sorry/axiom scans)
 - run_manifest.json        code commit, prompt hashes, model config
 - model_usage.json         token totals from the run's trace
+- lineage.json             per-round node lineage (ids, edits, splits)
 """
     (out / "README.md").write_text(readme, encoding="utf-8")
     return out

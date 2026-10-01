@@ -19,6 +19,7 @@ from typing import Callable
 from blueprint import Blueprint, BlueprintValidationError, generate_blueprint, validate_blueprint
 from checkpoint import CheckpointState
 from artifacts import write_success_artifact
+from lineage import compute_lineage, lineage_snapshot
 from run_fingerprint import fingerprint, run_manifest, skip_requested
 from lean_compiler import (
     AbstractLeanCompiler,
@@ -139,7 +140,8 @@ def _aux_lemma_decls(blueprint: Blueprint, proved_cache: dict[str, str], root_na
 
 def _write_artifact_safely(artifact_dir, *, theorem_name, verification,
                             manifest, blueprint_initial, blueprint_final,
-                            fallback_lean, trace_path) -> None:
+                            fallback_lean, trace_path,
+                            lineage_history=None) -> None:
     """Best-effort success artifact (review IV.8): a write failure is
     reported but never converts a verified proof into a failed run."""
     try:
@@ -152,6 +154,7 @@ def _write_artifact_safely(artifact_dir, *, theorem_name, verification,
             verification=verification, manifest=manifest,
             blueprint_initial=blueprint_initial, blueprint_final=blueprint_final,
             trace_path=trace_path,
+            lineage_history=lineage_history,
         )
         print(f"  [artifact] success bundle written to {out}", flush=True)
     except Exception as exc:
@@ -467,8 +470,18 @@ async def prove_theorem_async(
     # The graph as generated/resumed, before refinement rounds replace it -
     # shipped in the success artifact as blueprint.initial.json.
     initial_blueprint = blueprint
+    # Lineage bookkeeping across rounds: name -> (node_id, revision) as of
+    # the CURRENT blueprint (see src/lineage.py).
+    lineage_ids: dict[str, str] = {}
+    lineage_revisions: dict[str, int] = {}
+    lineage_entries, lineage_ids = compute_lineage(
+        [], blueprint.nodes)  # first round: everything is `new`
+    if checkpoint_path and not state.lineage_history:
+        state.lineage_history = [lineage_snapshot(lineage_entries)]
+        state.save(checkpoint_path)
 
     for iteration in range(start_iteration, max_iterations):
+        previous_round_nodes = list(blueprint.nodes)  # lineage baseline
         # Phase 2: Parallel proving
         nodes_to_try = _provable_nodes(blueprint) - set(proved_cache)
         print(f"\n[Phase 2 iteration {iteration+1}] Proving {len(nodes_to_try)} nodes: {sorted(nodes_to_try)}", flush=True)
@@ -565,6 +578,7 @@ async def prove_theorem_async(
                         blueprint_final=blueprint,
                         fallback_lean=_assemble_partial_file(blueprint, None, proved_cache),
                         trace_path=getattr(tracer, "path", None),
+                        lineage_history=state.lineage_history if checkpoint_path else [],
                     )
                 return ProofResult(
                     success=True,
@@ -641,6 +655,19 @@ async def prove_theorem_async(
         # before AND it solved no more nodes back then than we have now
         # (i.e. two consecutive rounds without a solved-count increase and a
         # repeated structure fingerprint).
+        lineage_entries, lineage_ids = compute_lineage(
+            [n for n in previous_round_nodes], blueprint.nodes,
+            previous_ids=lineage_ids,
+            previous_revisions=lineage_revisions)
+        lineage_revisions = {e.name: e.revision for e in lineage_entries.values()}
+        renames = [e for e in lineage_entries.values() if e.operation == "rename"]
+        if renames:
+            print(f"  [lineage] rename-only: "
+                  f"{', '.join(f'{e.parents_in_previous_graph[0]} -> {e.name}' for e in renames)}",
+                  flush=True)
+        if checkpoint_path:
+            state.lineage_history.append(lineage_snapshot(lineage_entries))
+
         new_fp = _structure_fingerprint(blueprint)
         if len(proved_cache) <= seen_structures.get(new_fp, -1):
             stagnation_rounds += 1
