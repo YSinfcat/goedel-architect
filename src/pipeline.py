@@ -314,6 +314,7 @@ async def prove_theorem_async(
     tactic_portfolio: list[str] | None = None,
     artifact_dir: Path | None = None,
     budget: Budget | None = None,
+    portfolio_cache: dict | None = None,
 ) -> ProofResult:
     """
     Full Goedel-Architect pipeline for a single theorem.
@@ -494,6 +495,10 @@ async def prove_theorem_async(
     # The graph as generated/resumed, before refinement rounds replace it -
     # shipped in the success artifact as blueprint.initial.json.
     initial_blueprint = blueprint
+    # One tactic-portfolio sweep cache per RUN (shared across refinement
+    # iterations): a round that echoes an unchanged node shape reuses the
+    # previous sweep instead of re-paying one Lean elaboration per tactic.
+    run_portfolio_cache = portfolio_cache if portfolio_cache is not None else {}
     # Lineage bookkeeping across rounds: name -> (node_id, revision) as of
     # the CURRENT blueprint (see src/lineage.py).
     lineage_ids: dict[str, str] = {}
@@ -531,6 +536,7 @@ async def prove_theorem_async(
                 enable_negation_probe=enable_negation_probe,
                 tactic_portfolio=tactic_portfolio,
                 budget=budget,
+                portfolio_cache=run_portfolio_cache,
             )
 
         for name, nr in orch_result.node_results.items():
@@ -780,6 +786,7 @@ def prove_theorem(
     tactic_portfolio: list[str] | None = None,
     artifact_dir: Path | None = None,
     budget: Budget | None = None,
+    portfolio_cache: dict | None = None,
 ) -> ProofResult:
     """Synchronous wrapper around prove_theorem_async (review IV.5): the
     library no longer calls asyncio.run() deep inside a sync API, which
@@ -811,6 +818,7 @@ def prove_theorem(
         tactic_portfolio=tactic_portfolio,
         artifact_dir=artifact_dir,
         budget=budget,
+        portfolio_cache=portfolio_cache,
     ))
 
 

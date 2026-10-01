@@ -112,6 +112,89 @@ class TestPortfolioInDag(unittest.TestCase):
         self.assertFalse(result.all_proved())
 
 
+class TestPortfolioCache(unittest.TestCase):
+    def test_cache_hit_avoids_recompilation(self):
+        from tactic_portfolio import run_tactic_portfolio
+
+        calls = []
+
+        class Counting:
+            def check(self, code, **_):
+                calls.append(code)
+                return CompilerResult(success=False, errors=["no"])
+
+            def check_blueprint(self, code, target):
+                return CompilerResult(success=True)
+
+        cache = {}
+        decl = "theorem n : True := by sorry_using []"
+        r1, f1 = run_tactic_portfolio(Counting(), decl, "", "n",
+                                      tactics=["simp", "omega"],
+                                      cache=cache, node_cache_key="K1")
+        first = len(calls)
+        self.assertIsNone(r1)
+        self.assertEqual(first, 2)
+        r2, f2 = run_tactic_portfolio(Counting(), decl, "", "n",
+                                      tactics=["simp", "omega"],
+                                      cache=cache, node_cache_key="K1")
+        self.assertEqual(len(calls), first)  # zero new compiles
+        self.assertIsNone(r2)
+        self.assertEqual(f2, f1)
+
+    def test_signature_or_aux_change_invalidates(self):
+        from tactic_portfolio import run_tactic_portfolio
+
+        class Fail:
+            def check(self, code, **_):
+                return CompilerResult(success=False, errors=["no"])
+
+            def check_blueprint(self, code, target):
+                return CompilerResult(success=True)
+
+        cache = {}
+        run_tactic_portfolio(Fail(), "theorem a : True := by sorry_using []", "",
+                             "a", tactics=["simp"], cache=cache, node_cache_key="K1")
+        # same key -> hit (no exception, zero compiles is implied by test above)
+        run_tactic_portfolio(Fail(), "theorem a : True := by sorry_using []", "",
+                             "a", tactics=["simp"], cache=cache, node_cache_key="K1")
+        # different node shape -> miss
+        run_tactic_portfolio(Fail(), "theorem a : False := by sorry_using []", "",
+                             "a", tactics=["simp"], cache=cache, node_cache_key="K2")
+        self.assertEqual(len(cache), 2)
+        # different aux context -> miss even with same node shape
+        run_tactic_portfolio(Fail(), "theorem a : True := by sorry_using []",
+                             "theorem helper : True := by trivial",
+                             "a", tactics=["simp"], cache=cache, node_cache_key="K1")
+        self.assertEqual(len(cache), 3)
+
+    def test_solved_sweep_also_cached(self):
+        from tactic_portfolio import run_tactic_portfolio
+
+        class OmegaOnly:
+            def __init__(self):
+                self.calls = 0
+
+            def check(self, code, **_):
+                self.calls += 1
+                ok = code.strip() == "by omega"
+                return CompilerResult(success=ok, errors=[] if ok else ["no"])
+
+            def check_blueprint(self, code, target):
+                return CompilerResult(success=True)
+
+        c = OmegaOnly()
+        cache = {}
+        decl = "theorem n : True := by sorry_using []"
+        r1, _ = run_tactic_portfolio(c, decl, "", "n", tactics=["simp", "omega"],
+                                     cache=cache, node_cache_key="K")
+        r2, _ = run_tactic_portfolio(c, decl, "", "n", tactics=["simp", "omega"],
+                                     cache=cache, node_cache_key="K")
+        self.assertIsNotNone(r1)
+        self.assertIsNotNone(r2)
+        self.assertEqual(r2.proof_body, r1.proof_body)
+        self.assertEqual(c.calls, 2)  # second sweep fully cached
+
+
 class TestPortfolioInFingerprint(unittest.TestCase):
     def test_portfolio_changes_fingerprint(self):
         off = run_manifest(model="m1")

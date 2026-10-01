@@ -100,6 +100,7 @@ async def prove_dag(
     enable_negation_probe: bool = False,
     tactic_portfolio: list[str] | None = None,
     budget: Budget | None = None,
+    portfolio_cache: dict | None = None,
 ) -> OrchestratorResult:
     """
     Prove all nodes in the blueprint DAG in parallel waves.
@@ -228,6 +229,7 @@ async def prove_dag(
                 enable_negation_probe=enable_negation_probe,
                 tactic_portfolio=tactic_portfolio,
                 budget=budget,
+                portfolio_cache=portfolio_cache,
             )
             for name in wave
         ]
@@ -260,6 +262,7 @@ async def _prove_one(
     enable_negation_probe: bool = False,
     tactic_portfolio: list[str] | None = None,
     budget: Budget | None = None,
+    portfolio_cache: dict | None = None,
 ) -> NodeResult:
     node = blueprint.node_by_name(name)
     assert node is not None
@@ -308,6 +311,7 @@ async def _prove_one(
         portfolio_result, portfolio_failures = run_tactic_portfolio(
             active_compiler, node.lean_declaration, parent_lemma_decls, name,
             tactics=tuple(tactic_portfolio), tracer=tracer,
+            cache=portfolio_cache, node_cache_key=node.cache_key(),
         )
         if portfolio_result is not None:
             print(f"    [node {name}] closed by tactic portfolio "
