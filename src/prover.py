@@ -86,7 +86,10 @@ Workflow:
 2. Call lean_compile with your proof_body — the tactic block starting with
    `by` (a `:= by`-prefixed body is also accepted; the harness normalizes
    either form and owns the single `:=` assignment when splicing).
-3. Read errors, adjust, call lean_compile again.
+3. Read errors, adjust, call lean_compile again. NEVER submit a proof
+   containing sorry or admit - it is rejected before compilation and the
+   turn is wasted. An incomplete proof is worth less than a sharp
+   analysis of what is missing.
 4. When you need a lemma whose name you do NOT already know:
    - call repo_search for project-specific lemmas
    - call mathlib_search for general Mathlib lemmas

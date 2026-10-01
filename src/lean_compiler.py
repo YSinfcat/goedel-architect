@@ -54,6 +54,11 @@ _SORRY_USING_RE = re.compile(r":=\s*by\s*sorry_using\s*\[[^\]]*\]", re.DOTALL)
 # `native_decide` trusts a compiled binary instead of the kernel checker.
 # Nothing previously enforced this; it was an honor-system instruction only.
 _FORBIDDEN_CONSTRUCT_RE = re.compile(r"\baxiom\b|\bnative_decide\b")
+# A prover submission containing sorry/admit is incomplete by definition;
+# the smoke run showed each one previously burned a FULL Lean elaboration
+# before the post-compile sorry check rejected it. Checked BEFORE Lean
+# runs (check() only - check_blueprint legitimately contains sorry_using).
+_INCOMPLETE_PROOF_RE = re.compile(r"\bsorry\b|\badmit\b|\bsorry_using\b")
 
 
 class MalformedProofBody(ValueError):
@@ -173,6 +178,15 @@ class LeanCompiler(AbstractLeanCompiler):
         forbidden = _reject_forbidden_constructs(code)
         if forbidden is not None:
             return forbidden
+        if _INCOMPLETE_PROOF_RE.search(lean_code) or _INCOMPLETE_PROOF_RE.search(aux_lemmas):
+            return CompilerResult(
+                success=False,
+                errors=["Safeguard rejected: submission contains sorry/admit - an "
+                        "incomplete proof. It was rejected WITHOUT compiling. Submit "
+                        "only complete proofs; if you cannot finish, analyze the "
+                        "goal and try a genuinely different approach."],
+                raw_output="Safeguard rejected",
+            )
 
         result = self._run_lean(code)
         if result.success and result.has_sorry:

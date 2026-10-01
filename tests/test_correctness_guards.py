@@ -96,6 +96,52 @@ class TestProofBodyNormalization(unittest.TestCase):
         self.assertIn("\\ sorry_free", out)
 
 
+class TestPrecompileSorryGuard(unittest.TestCase):
+    """Sorry/admit submissions must be rejected BEFORE Lean runs - the
+    smoke trace showed each one previously burning a full elaboration."""
+
+    def _compiler_that_must_not_run_lean(self):
+        from lean_compiler import LeanCompiler
+
+        class Guarded(LeanCompiler):
+            def _run_lean(self, code):
+                raise AssertionError("Lean must not run for sorry submissions")
+
+        return Guarded()
+
+    def test_sorry_rejected_without_compilation(self):
+        c = self._compiler_that_must_not_run_lean()
+        r = c.check("by sorry", node_decl="theorem t : True := by sorry_using []")
+        self.assertFalse(r.success)
+        self.assertIn("WITHOUT compiling", r.errors[0])
+
+    def test_admit_and_hidden_sorry_rejected(self):
+        c = self._compiler_that_must_not_run_lean()
+        for body in ("by admit",
+                     "by rw [h]; sorry",
+                     "by sorry_using []"):  # raw skeleton resubmission
+            r = c.check(body, node_decl="theorem t : True := by sorry_using []")
+            self.assertFalse(r.success, body)
+            self.assertIn("Safeguard", r.raw_output)
+
+    def test_sorry_in_aux_lemmas_also_rejected(self):
+        c = self._compiler_that_must_not_run_lean()
+        r = c.check("by trivial",
+                    aux_lemmas="theorem bad : False := by sorry",
+                    node_decl="theorem t : True := by sorry_using []")
+        self.assertFalse(r.success)
+
+    def test_clean_proof_still_compiles(self):
+        from lean_compiler import LeanCompiler, CompilerResult
+        # real invocation is fine for a clean proof - stub _run_lean to
+        # success to keep the test hermetic
+        class Ok(LeanCompiler):
+            def _run_lean(self, code):
+                return CompilerResult(success=True)
+        r = Ok().check("by trivial", node_decl="theorem t : True := by sorry_using []")
+        self.assertTrue(r.success)
+
+
 class TestSignals(unittest.TestCase):
     def test_text_false_claims_are_advisory(self):
         self.assertEqual(_classify_failure("this is false, see my counterexample"),
