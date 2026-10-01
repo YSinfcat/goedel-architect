@@ -41,6 +41,11 @@ PROVIDER_REGISTRY: dict[str, dict] = {
     },
     # everything else: plain OpenAI
     "openai": {"prefix": "", "base_url": None, "api_key_env": "OPENAI_API_KEY", "chat_only": False},
+    # Any other OpenAI-COMPATIBLE endpoint (DeepSeek, Together, a local
+    # vLLM/gateway, ...): set GOEDEL_BASE_URL and GOEDEL_API_KEY in .env
+    # and every model id routes there unless it matches a prefix above.
+    "custom": {"prefix": "\x00", "base_url_env": "GOEDEL_BASE_URL",
+               "api_key_env": "GOEDEL_API_KEY", "chat_only": False},
 }
 
 _CLIENT_CACHE: dict[tuple[str, float | None], OpenAI] = {}
@@ -78,15 +83,23 @@ def provider_for(model_id: str) -> tuple[str, dict]:
 
 def make_client(model_id: str, timeout: float | None = None) -> OpenAI:
     _load_env_once()
-    provider, cfg = provider_for(model_id)
+    # GOEDEL_BASE_URL/GOEDEL_API_KEY activate the custom OpenAI-compatible
+    # endpoint for any model id that doesn't match an explicit prefix.
+    custom_url = os.environ.get("GOEDEL_BASE_URL", "").strip()
+    if custom_url and custom_url != "\x00":
+        cfg = PROVIDER_REGISTRY["custom"]
+        provider = "custom"
+    else:
+        provider, cfg = provider_for(model_id)
     key = (provider, timeout)
     with _CLIENT_CACHE_LOCK:
         cached = _CLIENT_CACHE.get(key)
         if cached is not None:
             return cached
         kwargs: dict = {"timeout": timeout}
-        if cfg["base_url"]:
-            kwargs["base_url"] = cfg["base_url"]
+        base_url = os.environ.get(cfg.get("base_url_env", ""), "") if cfg.get("base_url_env") else cfg.get("base_url")
+        if base_url:
+            kwargs["base_url"] = base_url
             kwargs["api_key"] = os.environ[cfg["api_key_env"]]
         client = OpenAI(**kwargs)
         _CLIENT_CACHE[key] = client

@@ -152,6 +152,30 @@ class TestClientCache(unittest.TestCase):
         self.assertIsNot(a, c)
 
 
+class TestCustomEndpointRoute(unittest.TestCase):
+    def setUp(self):
+        llm_client._CLIENT_CACHE.clear()
+        self._saved = {k: os.environ.pop(k, None)
+                       for k in ("GOEDEL_BASE_URL", "GOEDEL_API_KEY")}
+
+    def tearDown(self):
+        llm_client._CLIENT_CACHE.clear()
+        for k, v in self._saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    def test_custom_base_url_routes_everything(self):
+        os.environ["GOEDEL_BASE_URL"] = "https://api.deepseek.com/v1"
+        os.environ["GOEDEL_API_KEY"] = "sk-test"
+        client = llm_client.make_client("deepseek-chat")
+        # the SDK normalizes a trailing slash onto the base URL
+        self.assertTrue(str(client.base_url).startswith("https://api.deepseek.com/v1"))
+
+    def test_without_custom_env_default_openai(self):
+        client = llm_client.make_client("gpt-5.5")
+        self.assertNotIn("deepseek", str(client.base_url))
+
+
 class TestProviderRegistry(unittest.TestCase):
     def test_prefix_routing(self):
         self.assertEqual(provider_for("accounts/fireworks/models/dsv4")[0], "fireworks")
