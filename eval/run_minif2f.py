@@ -67,6 +67,10 @@ def main() -> None:
                         help="Per-problem wall-clock ceiling in seconds.")
     parser.add_argument("--trace", metavar="PATH", nargs="?", const="",
                         help="Write JSONL traces (default: results/minif2f/trace_<name>.jsonl)")
+    parser.add_argument("--checkpoints", metavar="DIR", default=None,
+                        help="Per-problem checkpoints: killed runs resume mid-theorem, "
+                             "and a re-run after a fix reuses already-proved nodes "
+                             "instead of re-paying for them.")
     args = parser.parse_args()
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -92,11 +96,18 @@ def main() -> None:
             try:
                 from tracer import JsonlTracer, NullTracer
                 tracer = JsonlTracer(problem_trace) if problem_trace else NullTracer()
+                checkpoint_path = None
+                if args.checkpoints:
+                    from checkpoint import path_for_theorem
+                    ckpt_dir = Path(args.checkpoints)
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    checkpoint_path = path_for_theorem(ckpt_dir, name)
                 result = prove_theorem(
                     theorem_stmt=stmt,
                     nl_proof=nl_proof,
                     model=args.model,
                     max_iterations=args.max_iterations,
+                    checkpoint_path=checkpoint_path,
                     allow_unvalidated_blueprint=args.allow_unvalidated_blueprint,
                     enable_negation_probe=args.enable_negation_probe,
                     retry_failed=args.retry_failed,
