@@ -96,6 +96,51 @@ class TestProofBodyNormalization(unittest.TestCase):
         self.assertIn("\\ sorry_free", out)
 
 
+class TestPreambleAwareAssembly(unittest.TestCase):
+    """miniF2F statements ship with import/set_option/open preambles - the
+    first end-to-end run caught the naive assembly embedding imports
+    mid-file (Lean rejects) even though every node was proved."""
+
+    STMT_WITH_PREAMBLE = (
+        "import Mathlib\n\nset_option maxHeartbeats 0\n\n"
+        "open BigOperators Real\n\n"
+        "theorem aime_1983_p1 (x y z w : ℕ) : x = 2 := by\n  sorry"
+    )
+
+    def test_imports_stay_at_top(self):
+        from pipeline import _assemble_original_theorem_file
+        out = _assemble_original_theorem_file(self.STMT_WITH_PREAMBLE, "", "by norm_num")
+        lines = out.splitlines()
+        # every import line precedes any non-import content
+        last_import = max(i for i, l in enumerate(lines) if l.startswith("import "))
+        first_other = next(i for i, l in enumerate(lines)
+                           if l.strip() and not l.startswith("import "))
+        self.assertLess(last_import, first_other)
+        # deduplicated: exactly one `import Mathlib`
+        self.assertEqual(sum(1 for l in lines if l == "import Mathlib"), 1)
+        # preamble preserved between imports and the theorem
+        self.assertIn("set_option maxHeartbeats 0", out)
+        self.assertIn("open BigOperators Real", out)
+        # sorry replaced
+        self.assertNotIn("sorry", out)
+        self.assertIn(":= by norm_num", out)
+
+    def test_bare_statement_unchanged_shape(self):
+        from pipeline import _assemble_original_theorem_file
+        out = _assemble_original_theorem_file(
+            "theorem t (n : ℕ) : n = n := sorry", "", "by rfl")
+        self.assertTrue(out.startswith("import Mathlib"))
+        self.assertIn("theorem t (n : ℕ) : n = n := by rfl", out)
+
+    def test_aux_lemmas_after_preamble_before_theorem(self):
+        from pipeline import _assemble_original_theorem_file
+        out = _assemble_original_theorem_file(
+            self.STMT_WITH_PREAMBLE,
+            "theorem helper : True := by trivial", "by norm_num")
+        self.assertLess(out.index("set_option"), out.index("theorem helper"))
+        self.assertLess(out.index("theorem helper"), out.index("theorem aime_1983_p1"))
+
+
 class TestPrecompileSorryGuard(unittest.TestCase):
     """Sorry/admit submissions must be rejected BEFORE Lean runs - the
     smoke trace showed each one previously burning a full elaboration."""

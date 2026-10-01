@@ -65,6 +65,8 @@ def main() -> None:
                              "validations, and final verification all count).")
     parser.add_argument("--max-wall-time", type=float, default=None,
                         help="Per-problem wall-clock ceiling in seconds.")
+    parser.add_argument("--trace", metavar="PATH", nargs="?", const="",
+                        help="Write JSONL traces (default: results/minif2f/trace_<name>.jsonl)")
     args = parser.parse_args()
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -81,7 +83,15 @@ def main() -> None:
 
             print(f"[{i+1}/{len(problems)}] {name} ...", end=" ", flush=True)
             t0 = time.time()
+            problem_trace = None
+            if args.trace is not None:
+                base = Path(args.trace) if args.trace else Path(args.output).parent / "trace"
+                base.parent.mkdir(parents=True, exist_ok=True)
+                problem_trace = base.parent / f"{base.stem}_{name}.jsonl"
+                problem_trace.unlink(missing_ok=True)
             try:
+                from tracer import JsonlTracer, NullTracer
+                tracer = JsonlTracer(problem_trace) if problem_trace else NullTracer()
                 result = prove_theorem(
                     theorem_stmt=stmt,
                     nl_proof=nl_proof,
@@ -96,7 +106,10 @@ def main() -> None:
                     budget=Budget(max_total_tokens=args.max_tokens,
                                   max_compile_calls=args.max_compile_calls,
                                   max_wall_time_s=args.max_wall_time),
+                    tracer=tracer,
                 )
+                if problem_trace:
+                    tracer.close()
                 elapsed = time.time() - t0
                 status = "SOLVED" if result.success else "FAILED"
                 if result.success:

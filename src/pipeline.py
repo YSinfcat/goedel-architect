@@ -213,6 +213,9 @@ def _gate_blueprint(blueprint: Blueprint, allow_unvalidated: bool, had_compiler:
 _SORRY_TAIL_RE = re.compile(r":=\s*(?:by\s+)?sorry\s*\Z", re.DOTALL)
 
 
+_IMPORT_LINE_RE = re.compile(r"^import\s+[\w.]+\s*$", re.MULTILINE)
+
+
 def _assemble_original_theorem_file(
     theorem_stmt: str, aux_lemma_decls: str, root_proof: str,
 ) -> str:
@@ -228,17 +231,44 @@ def _assemble_original_theorem_file(
     no `:=` at all gets the proof appended; a statement that already has a
     non-sorry body is left as-is (its compile will fail rather than
     silently re-proving something else).
+
+    Benchmarks like miniF2F ship statements WITH a preamble (import /
+    set_option / open lines). Preamble imports are merged with the
+    standard header and kept at the top of the file - the first
+    end-to-end miniF2F run caught the naive assembly embedding them
+    mid-file ("invalid 'import' command"), which the final verification
+    correctly refused even though every node had been proved.
     """
     proof = format_proof_assign(root_proof)
     stmt = theorem_stmt.strip()
-    if _SORRY_TAIL_RE.search(stmt):
-        stmt = _SORRY_TAIL_RE.sub(lambda _: proof, stmt, count=1)
-    elif ":=" not in stmt:
-        stmt = f"{stmt} {proof}"
-    parts = [MATHLIB_HEADER.rstrip("\n")]
+
+    # split the statement into (import lines, non-import preamble, body)
+    import_lines = {m.group(0).strip() for m in _IMPORT_LINE_RE.finditer(stmt)}
+    stmt_wo_imports = _IMPORT_LINE_RE.sub("", stmt).strip()
+    first_theorem = re.search(r"^(?:@\[[^\]]*\]\s*\n\s*)?theorem\b",
+                              stmt_wo_imports, re.MULTILINE)
+    if first_theorem:
+        preamble = stmt_wo_imports[:first_theorem.start()].strip()
+        body = stmt_wo_imports[first_theorem.start():].strip()
+    else:
+        preamble, body = "", stmt_wo_imports
+
+    if _SORRY_TAIL_RE.search(body):
+        body = _SORRY_TAIL_RE.sub(lambda _: proof, body, count=1)
+    elif ":=" not in body:
+        body = f"{body} {proof}"
+
+    header_imports = ["import Mathlib", "import Architect"]
+    for line in sorted(import_lines):
+        if line not in header_imports:
+            header_imports.append(line)
+
+    parts = ["\n".join(header_imports)]
+    if preamble:
+        parts.append(preamble)
     if aux_lemma_decls.strip():
         parts.append(aux_lemma_decls.strip())
-    parts.append(stmt)
+    parts.append(body)
     return "\n\n".join(parts) + "\n"
 
 
